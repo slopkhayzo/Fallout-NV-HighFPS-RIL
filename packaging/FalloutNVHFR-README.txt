@@ -1,4 +1,4 @@
-FalloutNVHFR 1.0.0
+FalloutNVHFR 1.0.1
 High-frame-rate patch for Fallout: New Vegas
 ==================================================
 
@@ -16,12 +16,14 @@ second without running the game logic faster.
 Interpolated at the display frame rate:
   - player movement and the first- and third-person cameras, including
     crouching, falling, aiming (field of view) and reload view animations
-  - the first-person arms and weapon
+  - the first-person arms and weapon, including aiming down the sights and
+    crouching or standing up
   - the player's body in third person
   - other characters and creatures, including ragdolls
   - objects that move: carried, dropped and knocked-over items, doors and
     other animated objects, in the loaded area around you
   - the sky
+  - the VATS and kill cameras, including their slow motion
 Mouse look runs at the display frame rate.
 
 It also:
@@ -112,7 +114,6 @@ Known limitations
   - Parts of some weapon animations can look uneven. Noticed on the 9mm
     pistol: for about a third of a second at the start of aiming down the
     sights the weapon shakes. The cause was not found.
-  - VATS and kill cameras were not specifically tested.
   - The "spider hands" bug (fingers stretching at high frame rates) is not
     corrected by this patch.
   - New Vegas Tick Fix (NVTF) and New Vegas Stutter Remover change the same
@@ -141,6 +142,18 @@ Start the game once and open FalloutNVHFR.log next to the .asi.
     changed the same code after this patch. The patch is inactive.
   - "installed: frame hook=1 timer hook=1 ..." followed by "first frame: hook
     sites intact": the patch is installed and running.
+
+
+Changes
+-------
+1.0.1
+  - First person: the arms and weapon no longer step and trail the view
+    while aiming down the sights or crouching and standing up. The arms
+    are now drawn from the interpolated camera, and the whole arm and
+    weapon skeleton is interpolated.
+  - VATS and kill cameras are interpolated.
+1.0.0
+  - First release.
 
 
 Credits

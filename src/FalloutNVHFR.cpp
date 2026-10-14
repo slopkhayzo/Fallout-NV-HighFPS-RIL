@@ -29,7 +29,7 @@
 
 namespace {
 
-constexpr char kPatchVersion[] = "1.0.0";
+constexpr char kPatchVersion[] = "1.0.1";
 
 // The build this was developed against (GOG 1.4.0.525). Reported in the log
 // for comparison only; nothing is refused because of it.
@@ -95,6 +95,31 @@ constexpr CompositeSite kCompositeSites[] = {
     {0x0087075E, {0xE8, 0x6D, 0x04, 0x00, 0x00}, 0x00870BD0},
 };
 constexpr size_t kCompositeSiteCount = sizeof(kCompositeSites) / sizeof(kCompositeSites[0]);
+
+// The functions that draw the first-person node, with the scene camera itself
+// (FUN_006629F0), after the main world draw has been given its camera and had
+// it put back. FUN_00875110 (thiscall, four arguments) is the one of ordinary
+// play, called from the two hooked composites; FUN_008746D0 (thiscall, one
+// argument) runs instead of nothing only while an image-space effect is on.
+struct FirstPersonPassSite {
+    uintptr_t address;
+    uint8_t bytes[5];
+    uintptr_t target;
+};
+constexpr FirstPersonPassSite kFirstPersonPassSites[] = {
+    {0x00870ED0, {0xE8, 0xFB, 0x37, 0x00, 0x00}, 0x008746D0},
+    {0x00870B21, {0xE8, 0xEA, 0x45, 0x00, 0x00}, 0x00875110},
+    {0x00870F74, {0xE8, 0x97, 0x41, 0x00, 0x00}, 0x00875110},
+};
+constexpr size_t kFirstPersonPassSiteCount =
+    sizeof(kFirstPersonPassSites) / sizeof(kFirstPersonPassSites[0]);
+
+// VATS camera data (xNVSE, JIP): mode at +0x08, 4 while VATS plays back,
+// which includes the kill camera. FUN_009C8CC0 (the VATS time multiplier)
+// tests it the same way.
+constexpr uintptr_t kVatsCameraData = 0x011F2250;
+constexpr uintptr_t kVatsCameraMode = 0x08;
+constexpr uint32_t kVatsModePlayback = 4;
 constexpr uintptr_t kNodeName = 0x08;
 constexpr uintptr_t kNodeLocalTransform = 0x34;
 constexpr uintptr_t kPlayerFirstPersonRoot = 0x694;
@@ -259,6 +284,9 @@ constexpr LayoutAnchor kLayoutAnchors[] = {
     {0x00436A6E, 5, {0xB9, 0x80, 0x0E, 0x1E, 0x01, 0x00}, "process manager"},
     {0x0086E8CD, 6, {0x8B, 0x0D, 0x10, 0xEA, 0x1D, 0x01}, "TES pointer"},
     {0x00870FED, 6, {0x8B, 0x0D, 0x10, 0xEA, 0x1D, 0x01}, "TES pointer"},
+    {0x00498E06, 5, {0xB9, 0x50, 0x22, 0x1F, 0x01, 0x00}, "VATS camera data"},
+    {0x0052422E, 5, {0xB9, 0x50, 0x22, 0x1F, 0x01, 0x00}, "VATS camera data"},
+    {0x009C8CD1, 4, {0x83, 0x78, 0x08, 0x04, 0x00, 0x00}, "VATS camera mode test"},
 };
 
 // ---- State -----------------------------------------------------------------
@@ -286,6 +314,9 @@ bool g_interpolateFovEnabled = true;
 bool g_interpolateActorsEnabled = true;
 bool g_interpolateObjectsEnabled = true;
 bool g_menuRealTimeEnabled = true;
+bool g_firstPersonPassCameraEnabled = true;
+bool g_firstPersonWorldEnabled = true;
+bool g_killCamCameraEnabled = true;
 double g_simulationStepMs = 1000.0 / 60.0;
 double g_maxWallDeltaMs = 250.0;
 
@@ -333,6 +364,9 @@ uint8_t g_inputPollWritten[5]{};
 uint8_t g_worldDrawWritten[kWorldDrawSiteCount][5]{};
 uint8_t g_compositeWritten[kCompositeSiteCount][5]{};
 bool g_compositeInstalled[kCompositeSiteCount]{};
+uint8_t g_fpPassWritten[kFirstPersonPassSiteCount][5]{};
+bool g_fpPassSiteInstalled[kFirstPersonPassSiteCount]{};
+bool g_fpPassInstalled = false; // every site
 bool g_worldDrawInstalled[kWorldDrawSiteCount]{};
 bool g_inputPollInstalled = false;
 uint8_t g_auxTimerWritten[kAuxTimerSiteCount][5]{};
@@ -409,6 +443,32 @@ struct Counters {
     std::atomic<uint64_t> cameraRotationWrites{0};
     std::atomic<uint64_t> cameraRelationChanges{0};
     std::atomic<uint64_t> cameraRotationConflicts{0};
+    // World transforms below the first-person root, worked out from the
+    // blended locals for nodes whose world the engine had last computed from
+    // its own locals.
+    std::atomic<uint64_t> fpWorldWrites{0};
+    std::atomic<uint64_t> fpWorldSkipped{0};     // world not the engine's own: left alone
+    std::atomic<uint32_t> fpWorldSkippedMilli{0}; // largest distance of a skipped one, thousandths
+    std::atomic<uint64_t> fpWorldAdjusted{0};    // engine adjustment carried onto the blend
+    std::atomic<uint64_t> fpWorldKept{0};        // still ours after the render: the render used it
+    std::atomic<uint64_t> fpWorldOverwritten{0}; // the render recomputed it itself
+    std::atomic<uint64_t> fpPassCameraWrites{0}; // first-person pass given the blended camera
+    std::atomic<uint64_t> fpPassCameraSkipped{0}; // camera not as left by the main draw
+    std::atomic<uint64_t> fpPassCameraConflicts{0};
+    std::atomic<uint64_t> fpPassCameraUpdated{0}; // the pass recomputed the camera from its local
+    std::atomic<uint64_t> killCamDraws{0};       // eligible draws in VATS playback
+    std::atomic<uint64_t> killCamFirstPerson{0};
+    std::atomic<uint64_t> killCamIneligible{0};  // VATS playback on a frame that is not frozen
+    std::atomic<uint64_t> killCamChanges[4]{};   // camera changes by draw kind
+    std::atomic<uint64_t> killCamLate{0};        // change first seen on the draw after a tick
+    std::atomic<uint64_t> killCamAsIs{0};        // changed off a tick, or driven every frame
+    std::atomic<uint64_t> killCamSnaps{0};       // cut: shown at once
+    std::atomic<uint64_t> killCamWritten{0};
+    std::atomic<uint64_t> killCamMinor{0};        // small change away from a tick, let through
+    std::atomic<uint32_t> killCamTickMoveMilli{0}; // largest change near a tick, thousandths
+    std::atomic<uint32_t> killCamTickTurnMicro{0};
+    std::atomic<uint32_t> killCamOffMoveMilli{0};  // ... on other draws
+    std::atomic<uint32_t> killCamOffTurnMicro{0};
     std::atomic<uint64_t> fovCalls{0};
     std::atomic<uint64_t> fovSteps{0};          // a value stepped on a tick
     std::atomic<uint64_t> fovAsIs{0};           // changed off a tick or jumped
@@ -598,6 +658,12 @@ void FirstFrameCheck() {
     for (size_t i = 0; i < kCompositeSiteCount; ++i) {
         if (g_compositeInstalled[i] &&
             !MatchesBytes(kCompositeSites[i].address, g_compositeWritten[i], 5)) {
+            auxIntact = false;
+        }
+    }
+    for (size_t i = 0; i < kFirstPersonPassSiteCount; ++i) {
+        if (g_fpPassSiteInstalled[i] &&
+            !MatchesBytes(kFirstPersonPassSites[i].address, g_fpPassWritten[i], 5)) {
             auxIntact = false;
         }
     }
@@ -1394,6 +1460,10 @@ NodePose g_fpProbeWorld{};
 // The camera bone's world position written for the pass. If the render does
 // not recompute it, the engine's value is put back afterwards.
 SavedTranslation g_fpBoneSaved{};
+// World transforms written below the root (see WriteFirstPersonWorlds).
+SavedNodePose g_fpWorldSaved[1024];
+size_t g_fpWorldSavedCount = 0;
+void WriteFirstPersonWorlds();
 
 // ---- Field of view ------------------------------------------------------------
 struct FovTrack {
@@ -1791,6 +1861,7 @@ void FirstPersonWrite() {
             memcpy(live, pending.written.value, sizeof(pending.written.value));
             g_counters.fpWritten.fetch_add(1, std::memory_order_relaxed);
         }
+        if (g_firstPersonWorldEnabled) WriteFirstPersonWorlds();
         if (g_fpSavedCount != 0) {
             g_fpProbeNode = g_fpSaved[0].node;
             memcpy(g_fpProbeWorld.value,
@@ -1799,9 +1870,10 @@ void FirstPersonWrite() {
         }
         // The pass may read the camera bone's world position before it
         // updates the skeleton; give it the position that the blended locals
-        // will produce.
+        // will produce. WriteFirstPersonWorlds covers it when it runs.
         const uintptr_t cameraNode = g_fpCameraBone;
-        if (cameraNode >= 0x10000 && cameraNode != g_fpRoot && g_fpSavedCount != 0) {
+        if (!g_firstPersonWorldEnabled && cameraNode >= 0x10000 && cameraNode != g_fpRoot &&
+            g_fpSavedCount != 0) {
             float position[3];
             memcpy(position, reinterpret_cast<const void *>(cameraNode + kNodeLocalTransform + 36),
                    sizeof(position));
@@ -1852,6 +1924,19 @@ void FirstPersonRestore() {
             (changed ? g_counters.fpWorldRecomputed : g_counters.fpWorldUnchanged)
                 .fetch_add(1, std::memory_order_relaxed);
         }
+        // A world transform still holding what was written was used as it
+        // is and gets the engine's back; one the render recomputed is left.
+        for (size_t index = g_fpWorldSavedCount; index-- > 0;) {
+            const SavedNodePose &saved = g_fpWorldSaved[index];
+            auto *live = reinterpret_cast<void *>(saved.node + kNodeWorldTransform);
+            if (memcmp(live, saved.written.value, sizeof(saved.written.value)) != 0) {
+                g_counters.fpWorldOverwritten.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            memcpy(live, saved.pose.value, sizeof(saved.pose.value));
+            g_counters.fpWorldKept.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_fpWorldSavedCount = 0;
         if (g_fpBoneSaved.node != 0) {
             auto *bone = reinterpret_cast<void *>(g_fpBoneSaved.node + kNodeWorldTranslation);
             if (memcmp(bone, g_fpBoneSaved.written, sizeof(g_fpBoneSaved.written)) == 0) {
@@ -1873,6 +1958,7 @@ void FirstPersonRestore() {
     }
     g_fpSavedCount = 0;
     g_fpPendingCount = 0;
+    g_fpWorldSavedCount = 0;
     g_fpProbeNode = 0;
     g_fpAdvanced = false;
 }
@@ -1900,6 +1986,269 @@ const float *BlendedLocal(uintptr_t node, const float *engineLocal, bool &anyBle
         }
     }
     return engineLocal;
+}
+// The blended locals only show if something recomputes the world transforms
+// from them before the pass draws. The render does that on most frames; on
+// others (seen while the view moves, and suspected while crouching and
+// aiming) the skeleton's world transforms are the ones the engine computed
+// from its own locals earlier in the frame, and the arms show the tick's pose.
+// So every node below a blended one gets the world transform its blended
+// chain gives, worked out from the root down. Each node is checked against
+// its parent's world in memory: where its world is parent * local, it is
+// derived from its local; where the engine has adjusted it afterwards (seen
+// on Bip01 Spine2, which a check against the chain from the root therefore
+// failed for the whole arms and weapon below it), the adjustment is carried
+// over onto the blended pose; a world not related to the parent at all is
+// left alone, and so are its children's positions relative to it. Restored
+// after the composite unless the render overwrote it.
+bool WorldMatchesEngineChain(const float *live, const NodePose &computed) {
+    for (size_t index = 0; index < kPoseFloats; ++index) {
+        const float expected = computed.value[index];
+        const float tolerance = (index >= 9 && index < 12)
+            ? 0.05f + std::fabs(expected) * 2.0e-6f : 2.0e-4f;
+        if (!(std::fabs(live[index] - expected) <= tolerance)) return false;
+    }
+    return true;
+}
+
+// Diagnostic: one table of the whole first-person tree for a render, taken a
+// few times after the aim button changes. Per node: depth, parent row, name,
+// flags, and how far its world transform in memory is from (a) the engine
+// chain from the root, (b) its parent's world in memory times its own engine
+// local, (c) the same with its blended local. Written by the main thread,
+// printed by the log thread.
+struct WorldDumpRow {
+    char name[24];
+    uint16_t parent;
+    uint8_t depth;
+    uint8_t decision; // 0 not below a blend, 1 derived, 2 adjustment carried over, 3 left alone
+    uint8_t blended;  // its own local is blended
+    uint8_t isNode;
+    uint8_t controller;
+    uint32_t flags;
+    float chain[2];        // translation, rotation distance of what is shown
+    float parentEngine[2]; // ... from live parent * engine local
+    float parentBlend[2];  // ... from live parent * blended local
+};
+WorldDumpRow g_worldDump[1024];
+uint32_t g_worldDumpCount = 0;
+uint32_t g_worldDumpSerial = 0;
+uint8_t g_worldDumpKind = 0;
+float g_worldDumpAlpha = 0.0f;
+std::atomic<bool> g_worldDumpReady{false};
+bool g_worldDumpEnabled = false;
+uint32_t g_worldDumpCountdown = 0; // renders until the next dump; 0 = none pending
+uint32_t g_worldDumpsLeft = 12;
+uint32_t g_worldDumpsTaken = 0;
+
+void TransposeRotation(const float *in, float *out);
+
+void PoseDistance(const float *live, const NodePose &expected, float out[2]) {
+    out[0] = out[1] = 0.0f;
+    for (size_t index = 0; index < kPoseFloats; ++index) {
+        const float difference = std::fabs(live[index] - expected.value[index]);
+        float &largest = (index >= 9 && index < 12) ? out[0] : out[1];
+        if (!(difference <= largest)) largest = difference;
+    }
+}
+
+void WriteFirstPersonWorlds() {
+    g_fpWorldSavedCount = 0;
+    if (g_fpSavedCount == 0 || g_fpRoot < 0x10000) return;
+    struct Entry {
+        NodePose liveBefore; // the world in memory before this function wrote anything
+        NodePose blended;    // the world to show
+        bool moved;          // a blended local on the way from the root
+    };
+    bool dumping = false;
+    if (g_worldDumpEnabled && g_worldDumpCountdown != 0 && --g_worldDumpCountdown == 0 &&
+        !g_worldDumpReady.load(std::memory_order_acquire)) {
+        dumping = true;
+        g_worldDumpCount = 0;
+    }
+    static Entry entries[1024];
+    static struct {
+        uintptr_t object;
+        uint16_t parent;
+    } stack[512];
+    size_t entryCount = 1;
+    memcpy(entries[0].liveBefore.value,
+           reinterpret_cast<const void *>(g_fpRoot + kNodeWorldTransform),
+           sizeof(entries[0].liveBefore.value));
+    entries[0].blended = entries[0].liveBefore;
+    entries[0].moved = false;
+    static uint8_t depths[1024];
+    static uint16_t dumpRows[1024]; // entry index -> dump row
+    depths[0] = 0;
+    dumpRows[0] = 0xFFFF;
+    size_t top = 0;
+    const auto pushChildren = [&](uintptr_t node, uint16_t index) {
+        if (!IsSceneNode(node)) return;
+        const uintptr_t children = *reinterpret_cast<const uintptr_t *>(node + kNodeChildren);
+        const uint32_t count = *reinterpret_cast<const uint16_t *>(node + kNodeChildCount);
+        if (children < 0x10000 || count > 1024) return;
+        for (uint32_t child = 0; child < count && top < 512; ++child) {
+            stack[top].object = *reinterpret_cast<const uintptr_t *>(children + child * 4);
+            stack[top].parent = index;
+            ++top;
+        }
+    };
+    pushChildren(g_fpRoot, 0);
+    while (top != 0 && entryCount < 1024) {
+        const auto item = stack[--top];
+        const uintptr_t object = item.object;
+        if (object < 0x10000) continue;
+        const Entry &parent = entries[item.parent];
+        Entry &entry = entries[entryCount];
+        const uint16_t index = static_cast<uint16_t>(entryCount++);
+        pushChildren(object, index);
+        float buffer[13];
+        const float *engineLocal = EngineLocal(object, buffer);
+        bool blendedHere = false;
+        const float *blendedLocal = BlendedLocal(object, engineLocal, blendedHere);
+        auto *live = reinterpret_cast<float *>(object + kNodeWorldTransform);
+        memcpy(entry.liveBefore.value, live, sizeof(entry.liveBefore.value));
+        entry.moved = parent.moved || blendedHere;
+
+        // What the engine's own rule gives from the parent's world in
+        // memory: if the node's world is that, it is derived from its local.
+        // If not, the engine has adjusted it after (Bip01 Spine2 carries
+        // such an adjustment): the adjustment is kept, as a transform
+        // applied after parent * local, on top of the blended pose.
+        NodePose local;
+        NodePose expected;
+        memcpy(local.value, engineLocal, sizeof(local.value));
+        ComposePose(parent.liveBefore, local, expected);
+        const bool derived = WorldMatchesEngineChain(live, expected);
+        uint8_t decision = 0;
+        if (!entry.moved) {
+            entry.blended = entry.liveBefore;
+        } else {
+            NodePose blendedPose;
+            memcpy(local.value, blendedLocal, sizeof(local.value));
+            ComposePose(parent.blended, local, blendedPose);
+            if (derived) {
+                entry.blended = blendedPose;
+                decision = 1;
+            } else {
+                // adjustment = expected^-1 * live
+                NodePose inverse;
+                const float scale = expected.value[12];
+                bool usable = std::isfinite(scale) && std::fabs(scale) > 1.0e-6f;
+                if (usable) {
+                    TransposeRotation(expected.value, inverse.value);
+                    inverse.value[12] = 1.0f / scale;
+                    for (int row = 0; row < 3; ++row) {
+                        inverse.value[9 + row] =
+                            -(inverse.value[row * 3 + 0] * expected.value[9] +
+                              inverse.value[row * 3 + 1] * expected.value[10] +
+                              inverse.value[row * 3 + 2] * expected.value[11]) /
+                            scale;
+                    }
+                    NodePose adjustment;
+                    ComposePose(inverse, entry.liveBefore, adjustment);
+                    // An adjustment that moves the node far from where its
+                    // parent puts it means the world is not related to the
+                    // parent at all: then the node is left where it is.
+                    usable = std::fabs(adjustment.value[9]) <= 50.0f &&
+                             std::fabs(adjustment.value[10]) <= 50.0f &&
+                             std::fabs(adjustment.value[11]) <= 50.0f;
+                    if (usable) {
+                        ComposePose(blendedPose, adjustment, entry.blended);
+                        decision = 2;
+                        g_counters.fpWorldAdjusted.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (!usable) {
+                    entry.blended = entry.liveBefore;
+                    decision = 3;
+                    g_counters.fpWorldSkipped.fetch_add(1, std::memory_order_relaxed);
+                    float distance = 0.0f;
+                    for (size_t axis = 9; axis < 12; ++axis) {
+                        const float difference = std::fabs(live[axis] - expected.value[axis]);
+                        if (!(difference <= distance)) distance = difference;
+                    }
+                    AtomicMax(g_counters.fpWorldSkippedMilli,
+                              std::isfinite(distance) && distance < 4.0e6f
+                                  ? static_cast<uint32_t>(distance * 1000.0f) : 0xFFFFFFFFu);
+                }
+            }
+        }
+
+        depths[index] =
+            static_cast<uint8_t>(depths[item.parent] < 255 ? depths[item.parent] + 1 : 255);
+        dumpRows[index] = 0xFFFF;
+        if (dumping && g_worldDumpCount < 1024) {
+            dumpRows[index] = static_cast<uint16_t>(g_worldDumpCount);
+            WorldDumpRow *row = &g_worldDump[g_worldDumpCount++];
+            *row = {};
+            row->parent = dumpRows[item.parent];
+            row->depth = depths[index];
+            row->blended = blendedHere ? 1 : 0;
+            row->decision = decision;
+            row->isNode = IsSceneNode(object) ? 1 : 0;
+            row->controller =
+                *reinterpret_cast<const uintptr_t *>(object + kNodeController) >= 0x10000 ? 1 : 0;
+            row->flags = *reinterpret_cast<const uint32_t *>(object + 0x30);
+            const uintptr_t text = *reinterpret_cast<const uintptr_t *>(object + kNodeName);
+            if (text >= 0x10000) {
+                const char *source = reinterpret_cast<const char *>(text);
+                for (size_t length = 0; length + 1 < sizeof(row->name) && source[length] != 0;
+                     ++length) {
+                    const char c = source[length];
+                    row->name[length] = (c > 0x20 && c < 0x7F && c != ',') ? c : '_';
+                }
+            }
+            PoseDistance(live, entry.blended, row->chain);
+            PoseDistance(live, expected, row->parentEngine);
+            NodePose composed;
+            memcpy(local.value, blendedLocal, sizeof(local.value));
+            ComposePose(parent.liveBefore, local, composed);
+            PoseDistance(live, composed, row->parentBlend);
+        }
+
+        if (decision == 0 || decision == 3) continue;
+        bool finite = true;
+        for (const float component : entry.blended.value) finite = finite && std::isfinite(component);
+        if (!finite) {
+            entry.blended = entry.liveBefore;
+            continue;
+        }
+        if (g_fpWorldSavedCount >= 1024) continue;
+        if (memcmp(live, entry.blended.value, sizeof(entry.blended.value)) == 0) continue;
+        SavedNodePose &saved = g_fpWorldSaved[g_fpWorldSavedCount++];
+        saved.node = object;
+        memcpy(saved.pose.value, live, sizeof(saved.pose.value));
+        saved.written = entry.blended;
+        memcpy(live, entry.blended.value, sizeof(entry.blended.value));
+        g_counters.fpWorldWrites.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (dumping) {
+        g_worldDumpSerial = g_fpSerial;
+        g_worldDumpKind = g_fpPreviousFrameWasTick ? 1 : 0;
+        g_worldDumpAlpha = static_cast<float>(g_fpPreviousFrameAlpha);
+        ++g_worldDumpsTaken;
+        g_worldDumpReady.store(true, std::memory_order_release);
+    }
+}
+
+void FlushWorldDump() {
+    if (!g_worldDumpReady.load(std::memory_order_acquire)) return;
+    AppendStatus("world dump %u: serial=%u tick_frame=%u alpha=%.3f nodes=%u (columns: row parent "
+                 "depth name node controller flags own_blend decision[0 not below a blend, 1 "
+                 "derived from its local, 2 engine adjustment carried over, 3 left alone] | "
+                 "shown t r | parent*engine t r | parent*blend t r)",
+                 g_worldDumpsTaken, g_worldDumpSerial, g_worldDumpKind, g_worldDumpAlpha,
+                 g_worldDumpCount);
+    for (uint32_t index = 0; index < g_worldDumpCount; ++index) {
+        const WorldDumpRow &row = g_worldDump[index];
+        AppendStatus("wd %u %d %u %s %u %u %08X %u %u | %.3f %.5f | %.3f %.5f | %.3f %.5f", index,
+                     row.parent == 0xFFFF ? -1 : static_cast<int>(row.parent), row.depth,
+                     row.name[0] != 0 ? row.name : "-", row.isNode, row.controller, row.flags,
+                     row.blended, row.decision, row.chain[0], row.chain[1], row.parentEngine[0],
+                     row.parentEngine[1], row.parentBlend[0], row.parentBlend[1]);
+    }
+    g_worldDumpReady.store(false, std::memory_order_release);
 }
 
 bool ComputeCameraBoneDelta(const float *cameraPosition, float *delta) {
@@ -2120,6 +2469,135 @@ void RestoreCameraAnimationRotation() {
     }
     saved.camera = 0;
 }
+
+// The first-person pass draws the arms with the scene camera, which by then
+// has the engine's transform back. The arms are posed from the blended locals
+// about the engine's root, so the camera they need is the blended camera bone
+// about the same root: the engine's camera plus the bone's blended-minus-
+// engine position, with the blended rotation, and without the player's
+// position correction (the arms do not carry it). Without this the arms are
+// seen from the tick's camera bone, and every tick-driven move of that bone
+// (crouching, aiming) shows as a step of the arms against the screen.
+// The pass sets its field of view through FUN_00C52020, which ends with an
+// update of the camera node (FUN_00A59C60): the world transform is recomputed
+// from the local one, and a world-only write would be lost before the draw.
+// So the local transform is changed as well, to the one that gives the
+// blended world transform under the same parent.
+struct FirstPassCamera {
+    bool valid;
+    uintptr_t camera;
+    float engine[12];  // world rotation and translation as the main draw left them
+    float written[12];
+    float localEngine[12];
+    float localWritten[12];
+    bool local;        // the local transform was written too
+};
+FirstPassCamera g_fpPassCamera{};
+
+bool BeginFirstPersonPassCamera() {
+    FirstPassCamera &pass = g_fpPassCamera;
+    if (!pass.valid || !g_hooksInstalled.load(std::memory_order_relaxed) ||
+        GetCurrentThreadId() != g_mainThreadId) {
+        return false;
+    }
+    __try {
+        auto *live = reinterpret_cast<float *>(pass.camera + kNodeWorldTransform);
+        if (memcmp(live, pass.engine, sizeof(pass.engine)) != 0) {
+            g_counters.fpPassCameraSkipped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        // Under the same parent P: world = P * local, so P's rotation is
+        // W.R * L.R^T and its scale W.s / L.s. The local that gives the
+        // written world is L.R * W.R^T * R' for the rotation and
+        // L.t + (L.s / W.s) * L.R * W.R^T * (t' - t) for the translation.
+        auto *local = reinterpret_cast<float *>(pass.camera + kNodeLocalTransform);
+        const float worldScale = live[12];
+        const float localScale = local[12];
+        pass.local = false;
+        if (std::isfinite(worldScale) && std::isfinite(localScale) &&
+            std::fabs(worldScale) > 1.0e-6f) {
+            float worldInverse[9];
+            float toParent[9];
+            TransposeRotation(pass.engine, worldInverse);
+            MultiplyRotation(local, worldInverse, toParent);
+            float result[12];
+            MultiplyRotation(toParent, pass.written, result);
+            const float move[3] = {pass.written[9] - pass.engine[9],
+                                   pass.written[10] - pass.engine[10],
+                                   pass.written[11] - pass.engine[11]};
+            const float ratio = localScale / worldScale;
+            bool finite = true;
+            for (int row = 0; row < 3; ++row) {
+                result[9 + row] = local[9 + row] +
+                    ratio * (toParent[row * 3 + 0] * move[0] + toParent[row * 3 + 1] * move[1] +
+                             toParent[row * 3 + 2] * move[2]);
+            }
+            for (const float component : result) finite = finite && std::isfinite(component);
+            if (finite) {
+                memcpy(pass.localEngine, local, sizeof(pass.localEngine));
+                memcpy(pass.localWritten, result, sizeof(pass.localWritten));
+                memcpy(local, result, sizeof(result));
+                pass.local = true;
+            }
+        }
+        memcpy(live, pass.written, sizeof(pass.written));
+        g_counters.fpPassCameraWrites.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_counters.faults.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+}
+
+void EndFirstPersonPassCamera() {
+    const FirstPassCamera &pass = g_fpPassCamera;
+    __try {
+        auto *live = reinterpret_cast<float *>(pass.camera + kNodeWorldTransform);
+        if (pass.local) {
+            // The world transform may have been recomputed from the written
+            // local in the pass; it is the engine's again once the local is.
+            auto *local = reinterpret_cast<float *>(pass.camera + kNodeLocalTransform);
+            if (memcmp(local, pass.localWritten, sizeof(pass.localWritten)) == 0) {
+                memcpy(local, pass.localEngine, sizeof(pass.localEngine));
+                memcpy(live, pass.engine, sizeof(pass.engine));
+                if (memcmp(live, pass.written, sizeof(pass.written)) != 0) {
+                    g_counters.fpPassCameraUpdated.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                g_counters.fpPassCameraConflicts.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (memcmp(live, pass.written, sizeof(pass.written)) == 0) {
+            memcpy(live, pass.engine, sizeof(pass.engine));
+        } else {
+            g_counters.fpPassCameraConflicts.fetch_add(1, std::memory_order_relaxed);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_counters.faults.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void __fastcall FirstPersonPassHook(void *self, void * /*edx*/, uint32_t arg0) {
+    using PassFn = void(__thiscall *)(void *, uint32_t);
+    const auto stock = reinterpret_cast<PassFn>(kFirstPersonPassSites[0].target);
+    const bool wrote = BeginFirstPersonPassCamera();
+    stock(self, arg0);
+    if (wrote) EndFirstPersonPassCamera();
+}
+
+void __fastcall FirstPersonDrawHook(void *self, void * /*edx*/, uint32_t arg0, uint32_t arg1,
+                                    uint32_t arg2, uint32_t arg3) {
+    using DrawFn = void(__thiscall *)(void *, uint32_t, uint32_t, uint32_t, uint32_t);
+    const auto stock = reinterpret_cast<DrawFn>(kFirstPersonPassSites[1].target);
+    const bool wrote = BeginFirstPersonPassCamera();
+    stock(self, arg0, arg1, arg2, arg3);
+    if (wrote) EndFirstPersonPassCamera();
+}
+
+const void *const kFirstPersonPassHooks[kFirstPersonPassSiteCount] = {
+    reinterpret_cast<const void *>(&FirstPersonPassHook),
+    reinterpret_cast<const void *>(&FirstPersonDrawHook),
+    reinterpret_cast<const void *>(&FirstPersonDrawHook),
+};
 
 // ---- Other characters -----------------------------------------------------------
 // Every node below the 3D root of each actor in the process manager's high
@@ -2647,7 +3125,122 @@ constexpr uint32_t kCameraWarmUpDraws = 60;
 // A step above 150 units in one tick is a teleport and is shown at once.
 constexpr float kTeleportDistanceSquared = 22500.0f;
 
+// VATS playback, kill camera included. The camera is placed by the VATS
+// camera, not by the player, and it is not under the mouse: none of the
+// player-relative corrections apply, and it moves on ticks like any animated
+// node. Its whole world transform gets a tick-aligned from/to pair, with the
+// rules of the character pass. Measured in the first run: it changes on the
+// tick draw and again on the draw after (it follows the target, whose pose
+// arrives a draw late), and by some amount on most other draws. So a change
+// on either draw is this tick's pose, the second replacing the first and
+// shown with the previous draw's phase; a small change on any other draw is
+// let through (the next tick's pose includes it); a large one means it is
+// driven every frame and it is shown as it is for a while; a cut is shown at
+// once.
+struct CameraTrack {
+    bool valid;
+    bool lag;
+    uint8_t offTickScore;
+    uint32_t lastSeen;
+    uint32_t changePeriod;
+    NodePose from;
+    NodePose to;
+    NodePose periodFrom; // what was shown before this tick's first change
+};
+CameraTrack g_killCamTrack{};
+uint32_t g_killCamSerial = 1;
+uint32_t g_killCamTickCount = 0;
+bool g_killCamPreviousWasTick = false;
+double g_killCamPreviousAlpha = 0.0;
+
+bool InVatsPlayback() {
+    return *reinterpret_cast<const uint32_t *>(kVatsCameraData + kVatsCameraMode) ==
+           kVatsModePlayback;
+}
+
+// Called on every eligible draw so that the tick history is current; returns
+// true with the pose to show when the camera is in a blend.
+bool AdvanceKillCamTrack(uintptr_t camera, bool active, bool tick, double alpha,
+                         NodePose &shown) {
+    const uint32_t ticksBefore = g_killCamTickCount;
+    if (tick) ++g_killCamTickCount;
+    const bool previousWasTick = g_killCamPreviousWasTick;
+    const double previousAlpha = g_killCamPreviousAlpha;
+    g_killCamPreviousWasTick = tick;
+    g_killCamPreviousAlpha = alpha;
+    ++g_killCamSerial;
+    CameraTrack &track = g_killCamTrack;
+    if (!active) {
+        track.valid = false;
+        return false;
+    }
+    const int frameKind = tick ? (previousWasTick ? 2 : 0) : (previousWasTick ? 1 : 3);
+    NodePose current;
+    memcpy(current.value, reinterpret_cast<const void *>(camera + kNodeWorldTransform),
+           sizeof(current.value));
+    if (!track.valid || track.lastSeen + 1 != g_killCamSerial) {
+        track = {};
+        track.valid = true;
+        track.lastSeen = g_killCamSerial;
+        track.from = track.to = track.periodFrom = current;
+        return false;
+    }
+    track.lastSeen = g_killCamSerial;
+    if (track.offTickScore != 0) --track.offTickScore;
+    if (memcmp(track.to.value, current.value, 12 * sizeof(float)) != 0) {
+        g_counters.killCamChanges[frameKind].fetch_add(1, std::memory_order_relaxed);
+        float turn = 0.0f;
+        for (size_t index = 0; index < 9; ++index) {
+            const float difference = std::fabs(current.value[index] - track.to.value[index]);
+            if (!(difference <= turn)) turn = difference;
+        }
+        const float moveSquared = DistanceSquared(&current.value[9], &track.to.value[9]);
+        const float move = std::sqrt(moveSquared);
+        const bool nearTick = frameKind != 3;
+        AtomicMax(nearTick ? g_counters.killCamTickMoveMilli : g_counters.killCamOffMoveMilli,
+                  std::isfinite(move) && move < 4.0e6f ? static_cast<uint32_t>(move * 1000.0f)
+                                                       : 0xFFFFFFFFu);
+        AtomicMax(nearTick ? g_counters.killCamTickTurnMicro : g_counters.killCamOffTurnMicro,
+                  std::isfinite(turn) && turn < 4.0e3f ? static_cast<uint32_t>(turn * 1.0e6f)
+                                                       : 0xFFFFFFFFu);
+        if (!(moveSquared <= kTeleportDistanceSquared) || !(turn <= 0.5f)) {
+            g_counters.killCamSnaps.fetch_add(1, std::memory_order_relaxed);
+            track.from = track.to = track.periodFrom = current;
+            track.changePeriod = 0;
+            return false;
+        }
+        const bool perFrame = track.offTickScore >= 8;
+        if (nearTick && !perFrame) {
+            // The period this pose belongs to: the tick of this draw, or of
+            // the draw before when this one is not a tick.
+            if (track.changePeriod != g_killCamTickCount) track.periodFrom = track.to;
+            track.from = track.periodFrom;
+            track.to = current;
+            track.lag = !tick;
+            if (track.lag) g_counters.killCamLate.fetch_add(1, std::memory_order_relaxed);
+            track.changePeriod = g_killCamTickCount;
+        } else if (!nearTick && !perFrame && turn <= 0.002f && move <= 0.25f) {
+            // Small, away from a tick: let through.
+            g_counters.killCamMinor.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (!nearTick) {
+                track.offTickScore = static_cast<uint8_t>(
+                    track.offTickScore > 12 ? 16 : track.offTickScore + 4);
+            }
+            g_counters.killCamAsIs.fetch_add(1, std::memory_order_relaxed);
+            track.from = track.to = track.periodFrom = current;
+            track.changePeriod = 0;
+            return false;
+        }
+    }
+    const uint32_t period = track.lag ? ticksBefore : g_killCamTickCount;
+    if (track.changePeriod == 0 || track.changePeriod != period) return false;
+    if (!BlendPose(track.from, track.to, track.lag ? previousAlpha : alpha, shown)) return false;
+    return memcmp(shown.value, current.value, 12 * sizeof(float)) != 0;
+}
+
 void ResetDrawInterpolation() {
+    g_killCamTrack.valid = false;
     g_playerHistory = {};
     g_cameraEligibleDraws = 0;
     g_lastCameraPositionValid = false;
@@ -2667,6 +3260,7 @@ struct DrawWrites {
 
 void PrepareDraw(DrawWrites &writes) {
     writes = {};
+    g_fpPassCamera.valid = false;
     if (g_frameTickDecision < 0) {
         g_counters.drawsOutsideFrame.fetch_add(1, std::memory_order_relaxed);
         ResetDrawInterpolation();
@@ -2678,6 +3272,7 @@ void PrepareDraw(DrawWrites &writes) {
     }
     if (!g_frameEligible) {
         g_counters.drawsIneligible.fetch_add(1, std::memory_order_relaxed);
+        if (InVatsPlayback()) g_counters.killCamIneligible.fetch_add(1, std::memory_order_relaxed);
         ResetDrawInterpolation();
         return;
     }
@@ -2708,6 +3303,17 @@ void PrepareDraw(DrawWrites &writes) {
                sizeof(current));
         float *position = reinterpret_cast<float *>(camera + kNodeWorldTranslation);
         memcpy(writes.cameraEngine, position, sizeof(float) * 3);
+        float cameraTransform[12];
+        memcpy(cameraTransform, reinterpret_cast<const void *>(camera + kNodeWorldTransform),
+               sizeof(cameraTransform));
+        const bool killCam = g_killCamCameraEnabled && InVatsPlayback();
+        NodePose killCamShown{};
+        const bool killCamMoves =
+            AdvanceKillCamTrack(camera, killCam, tick, alpha, killCamShown);
+        if (killCam) {
+            g_counters.killCamDraws.fetch_add(1, std::memory_order_relaxed);
+            if (firstPerson) g_counters.killCamFirstPerson.fetch_add(1, std::memory_order_relaxed);
+        }
 
         if (g_lastCameraPositionValid &&
             DistanceSquared(writes.cameraEngine, g_lastCameraPosition) > 1.0e-6f) {
@@ -2745,7 +3351,7 @@ void PrepareDraw(DrawWrites &writes) {
         // blending starts.
         float thirdPersonDelta[3] = {0.0f, 0.0f, 0.0f};
         bool thirdPersonMoves = false;
-        if (!firstPerson && g_thirdPersonCameraEnabled) {
+        if (!killCam && !firstPerson && g_thirdPersonCameraEnabled) {
             thirdPersonMoves = ThirdPersonCameraDelta(camera, writes.cameraEngine, current, tick,
                                                       alpha, thirdPersonDelta);
         } else {
@@ -2767,12 +3373,50 @@ void PrepareDraw(DrawWrites &writes) {
                 squared = 0.0f;
             }
             float boneDelta[3] = {0.0f, 0.0f, 0.0f};
-            const bool boneMoves = firstPerson && g_firstPersonEnabled &&
+            const bool boneMoves = !killCam && firstPerson && g_firstPersonEnabled &&
                                    ComputeCameraBoneDelta(writes.cameraEngine, boneDelta);
-            if (firstPerson && g_firstPersonEnabled) {
+            if (!killCam && firstPerson && g_firstPersonEnabled) {
                 writes.rotation = ApplyCameraAnimationRotation(camera);
             }
-            if (squared > 1.0e-8f || thirdPersonMoves || boneMoves) {
+            if (!killCam && firstPerson && g_firstPersonEnabled && g_firstPersonPassCameraEnabled &&
+                g_fpPassInstalled && (boneMoves || writes.rotation)) {
+                FirstPassCamera &pass = g_fpPassCamera;
+                pass.camera = camera;
+                memcpy(pass.engine, cameraTransform, sizeof(pass.engine));
+                memcpy(pass.written, cameraTransform, sizeof(pass.written));
+                if (writes.rotation) {
+                    memcpy(pass.written, g_cameraRotationSaved.written, 9 * sizeof(float));
+                }
+                for (int axis = 0; axis < 3; ++axis) pass.written[9 + axis] += boneDelta[axis];
+                pass.valid = true;
+            }
+            if (killCam) {
+                // The VATS camera's own blend replaces every other correction
+                // of the camera. The player's correction is still worked out
+                // above for the body.
+                if (killCamMoves) {
+                    SavedCameraRotation &saved = g_cameraRotationSaved;
+                    saved.camera = camera;
+                    memcpy(saved.original, cameraTransform, sizeof(saved.original));
+                    memcpy(saved.written, killCamShown.value, sizeof(saved.written));
+                    memcpy(reinterpret_cast<void *>(camera + kNodeWorldTransform), saved.written,
+                           sizeof(saved.written));
+                    writes.rotation = true;
+                    float total[3];
+                    for (int axis = 0; axis < 3; ++axis) {
+                        writes.cameraWritten[axis] = killCamShown.value[9 + axis];
+                        total[axis] = writes.cameraWritten[axis] - writes.cameraEngine[axis];
+                    }
+                    memcpy(position, writes.cameraWritten, sizeof(float) * 3);
+                    writes.cameraPosition = position;
+                    writes.camera = true;
+                    g_counters.killCamWritten.fetch_add(1, std::memory_order_relaxed);
+                    if (g_shiftSkyEnabled) {
+                        ShiftSkyForDraw(total);
+                        writes.sky = g_skySavedCount != 0;
+                    }
+                }
+            } else if (squared > 1.0e-8f || thirdPersonMoves || boneMoves) {
                 float total[3];
                 for (int axis = 0; axis < 3; ++axis) {
                     total[axis] = correction[axis] + boneDelta[axis] +
@@ -2900,6 +3544,12 @@ void __fastcall InputPollHook(void *self, void * /*edx*/) {
     if (aimButton != lastAimButton) {
         lastAimButton = aimButton;
         if (g_fpTraceEnabled) g_fpTraceHot = 150;
+        // One table per change, alternately early in the transition (8
+        // renders) and later (30 renders).
+        if (g_worldDumpEnabled && g_worldDumpsLeft != 0 && g_worldDumpCountdown == 0) {
+            g_worldDumpCountdown = g_worldDumpsLeft % 2 == 0 ? 8 : 30;
+            --g_worldDumpsLeft;
+        }
     }
 }
 
@@ -2941,6 +3591,7 @@ void __fastcall GameFrameHook(void *self, void * /*edx*/) {
     const bool frozen = BeginFrozenFrame(self);
     reinterpret_cast<ThisCallNoArgs>(kFrameFunction)(self);
     if (frozen) static_cast<uint8_t *>(self)[7] = 0;
+    g_fpPassCamera.valid = false;
     g_frameTickDecision = -1;
     g_frameEligible = false;
     g_frameNativeStep = false;
@@ -3087,6 +3738,7 @@ DWORD WINAPI LogThread(LPVOID) {
         for (int i = 0; i < 50 && !g_stop.load(std::memory_order_acquire); ++i) {
             Sleep(100);
             FlushFirstPersonTrace();
+            FlushWorldDump();
         }
         if (!g_hooksInstalled.load(std::memory_order_acquire)) continue;
 
@@ -3264,6 +3916,58 @@ DWORD WINAPI LogThread(LPVOID) {
             memcpy(last, now, sizeof(last));
         }
         {
+            static uint64_t last[18]{};
+            static uint64_t lastKillCamMinor = 0;
+            static uint64_t lastPassUpdated = 0;
+            static uint64_t lastWorldAdjusted = 0;
+            const uint64_t now[18] = {
+                g_counters.fpWorldWrites.load(std::memory_order_relaxed),
+                g_counters.fpWorldSkipped.load(std::memory_order_relaxed),
+                g_counters.fpWorldKept.load(std::memory_order_relaxed),
+                g_counters.fpWorldOverwritten.load(std::memory_order_relaxed),
+                g_counters.fpPassCameraWrites.load(std::memory_order_relaxed),
+                g_counters.fpPassCameraSkipped.load(std::memory_order_relaxed),
+                g_counters.fpPassCameraConflicts.load(std::memory_order_relaxed),
+                g_counters.killCamDraws.load(std::memory_order_relaxed),
+                g_counters.killCamFirstPerson.load(std::memory_order_relaxed),
+                g_counters.killCamIneligible.load(std::memory_order_relaxed),
+                g_counters.killCamChanges[0].load(std::memory_order_relaxed),
+                g_counters.killCamChanges[1].load(std::memory_order_relaxed),
+                g_counters.killCamChanges[2].load(std::memory_order_relaxed),
+                g_counters.killCamChanges[3].load(std::memory_order_relaxed),
+                g_counters.killCamLate.load(std::memory_order_relaxed),
+                g_counters.killCamAsIs.load(std::memory_order_relaxed),
+                g_counters.killCamSnaps.load(std::memory_order_relaxed),
+                g_counters.killCamWritten.load(std::memory_order_relaxed)};
+            AppendStatus(
+                "first_world writes=%llu skipped=%llu (max %.3f) adjusted=%llu kept=%llu "
+                "overwritten=%llu | first_pass "
+                "camera writes=%llu skipped=%llu conflicts=%llu recomputed=%llu | killcam draws=%llu "
+                "first_person=%llu ineligible=%llu changes tick=%llu after=%llu both=%llu "
+                "neither=%llu late=%llu as_is=%llu snaps=%llu written=%llu minor=%llu vats_mode=%u "
+                "largest change near tick %.3f units %.6f, other draws %.3f units %.6f",
+                now[0] - last[0], now[1] - last[1],
+                g_counters.fpWorldSkippedMilli.exchange(0, std::memory_order_relaxed) / 1000.0,
+                g_counters.fpWorldAdjusted.load(std::memory_order_relaxed) - lastWorldAdjusted,
+                now[2] - last[2], now[3] - last[3],
+                now[4] - last[4], now[5] - last[5], now[6] - last[6],
+                g_counters.fpPassCameraUpdated.load(std::memory_order_relaxed) - lastPassUpdated,
+                now[7] - last[7],
+                now[8] - last[8], now[9] - last[9], now[10] - last[10], now[11] - last[11],
+                now[12] - last[12], now[13] - last[13], now[14] - last[14], now[15] - last[15],
+                now[16] - last[16], now[17] - last[17],
+                g_counters.killCamMinor.load(std::memory_order_relaxed) - lastKillCamMinor,
+                *reinterpret_cast<const uint32_t *>(kVatsCameraData + kVatsCameraMode),
+                g_counters.killCamTickMoveMilli.exchange(0, std::memory_order_relaxed) / 1000.0,
+                g_counters.killCamTickTurnMicro.exchange(0, std::memory_order_relaxed) / 1.0e6,
+                g_counters.killCamOffMoveMilli.exchange(0, std::memory_order_relaxed) / 1000.0,
+                g_counters.killCamOffTurnMicro.exchange(0, std::memory_order_relaxed) / 1.0e6);
+            lastKillCamMinor = g_counters.killCamMinor.load(std::memory_order_relaxed);
+            lastPassUpdated = g_counters.fpPassCameraUpdated.load(std::memory_order_relaxed);
+            lastWorldAdjusted = g_counters.fpWorldAdjusted.load(std::memory_order_relaxed);
+            memcpy(last, now, sizeof(last));
+        }
+        {
             static uint64_t last[15]{};
             const uint64_t now[15] = {
                 g_counters.actorPasses.load(std::memory_order_relaxed),
@@ -3388,6 +4092,14 @@ void ReadConfiguration() {
         GetPrivateProfileIntW(L"Presentation", L"bInterpolateObjects", 1, path.c_str()) != 0;
     g_interpolateFovEnabled =
         GetPrivateProfileIntW(L"Presentation", L"bInterpolateFov", 1, path.c_str()) != 0;
+    g_firstPersonPassCameraEnabled =
+        GetPrivateProfileIntW(L"Presentation", L"bFirstPersonPassCamera", 1, path.c_str()) != 0;
+    g_firstPersonWorldEnabled =
+        GetPrivateProfileIntW(L"Presentation", L"bFirstPersonWorld", 1, path.c_str()) != 0;
+    g_killCamCameraEnabled =
+        GetPrivateProfileIntW(L"Presentation", L"bKillCamCamera", 1, path.c_str()) != 0;
+    g_worldDumpEnabled = g_telemetryEnabled &&
+        GetPrivateProfileIntW(L"Tracing", L"bWorldDump", 0, path.c_str()) != 0;
     g_fpTraceEnabled = g_telemetryEnabled &&
         GetPrivateProfileIntW(L"Tracing", L"bAimTrace", 0, path.c_str()) != 0;
 
@@ -3439,6 +4151,13 @@ bool VerifyTargetLayout() {
     for (const CompositeSite &site : kCompositeSites) {
         if (!MatchesBytes(site.address, site.bytes, 5)) {
             AppendStatus("layout: composite render call at %08IX does not hold the expected "
+                         "bytes", site.address);
+            return false;
+        }
+    }
+    for (const FirstPersonPassSite &site : kFirstPersonPassSites) {
+        if (!MatchesBytes(site.address, site.bytes, 5)) {
+            AppendStatus("layout: first-person draw call at %08IX does not hold the expected "
                          "bytes", site.address);
             return false;
         }
@@ -3529,7 +4248,24 @@ BOOL CALLBACK InitializePatch(PINIT_ONCE, PVOID, PVOID *) {
                               kCompositeSites[i].bytes, g_compositeWritten[i]);
         auxOk = g_compositeInstalled[i];
     }
+    if (auxOk && g_interpolateCameraEnabled && g_firstPersonEnabled &&
+        g_firstPersonPassCameraEnabled) {
+        for (size_t i = 0; auxOk && i < kFirstPersonPassSiteCount; ++i) {
+            g_fpPassSiteInstalled[i] =
+                PatchRelativeCall(kFirstPersonPassSites[i].address, kFirstPersonPassHooks[i],
+                                  kFirstPersonPassSites[i].bytes, g_fpPassWritten[i]);
+            auxOk = g_fpPassSiteInstalled[i];
+        }
+        g_fpPassInstalled = auxOk;
+    }
     if (!frameOk || !timerOk || !auxOk) {
+        for (size_t i = 0; i < kFirstPersonPassSiteCount; ++i) {
+            if (g_fpPassSiteInstalled[i]) {
+                RestoreBytes(kFirstPersonPassSites[i].address, kFirstPersonPassSites[i].bytes);
+                g_fpPassSiteInstalled[i] = false;
+            }
+        }
+        g_fpPassInstalled = false;
         for (size_t i = 0; i < kCompositeSiteCount; ++i) {
             if (g_compositeInstalled[i]) {
                 RestoreBytes(kCompositeSites[i].address, kCompositeSites[i].bytes);
@@ -3585,14 +4321,19 @@ BOOL CALLBACK InitializePatch(PINIT_ONCE, PVOID, PVOID *) {
                  "no_timer_sleeps=%d max_wall_delta_ms=%.1f freeze_frames=%d "
                  "align_havok_step=%d latch_input=%d menu_mouse_no_acceleration=%d "
                  "interpolate_camera=%d sky=%d third_person_camera=%d "
-                 "third_person_body=%d first_person=%d",
+                 "third_person_body=%d first_person=%d first_person_pass_camera=%d "
+                 "first_person_world=%d kill_cam_camera=%d interpolate_fov=%d actors=%d "
+                 "objects=%d menu_real_time=%d",
                  g_fixedTickEnabled ? 1 : 0, 1000.0 / g_simulationStepMs,
                  g_noTimerSleepsEnabled ? 1 : 0, g_maxWallDeltaMs,
                  g_freezeFramesEnabled ? 1 : 0, g_alignHavokStepEnabled ? 1 : 0,
                  g_latchInputEnabled ? 1 : 0, g_menuMouseNoAcceleration ? 1 : 0,
                  g_interpolateCameraEnabled ? 1 : 0, g_shiftSkyEnabled ? 1 : 0,
                  g_thirdPersonCameraEnabled ? 1 : 0, g_thirdPersonBodyEnabled ? 1 : 0,
-                 g_firstPersonEnabled ? 1 : 0);
+                 g_firstPersonEnabled ? 1 : 0, g_fpPassInstalled ? 1 : 0,
+                 g_firstPersonWorldEnabled ? 1 : 0, g_killCamCameraEnabled ? 1 : 0,
+                 g_interpolateFovEnabled ? 1 : 0, g_interpolateActorsEnabled ? 1 : 0,
+                 g_interpolateObjectsEnabled ? 1 : 0, g_menuRealTimeEnabled ? 1 : 0);
     return TRUE;
 }
 

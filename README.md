@@ -8,7 +8,7 @@ on every frame.
 It is a port of the Fallout 3 patch (Fallout3HFR 1.0.0) and ships as an ASI
 plugin.
 
-**Current version: 1.0.0.** Download it from the
+**Current version: 1.0.1.** Download it from the
 [Releases page](https://github.com/slopkhayzo/Fallout-NV-HighFPS-RIL/releases).
 
 ## Download
@@ -17,8 +17,8 @@ Each release has two zip files:
 
 | File | Contents | Use it if |
 | --- | --- | --- |
-| `FalloutNVHFR-1.0.0.zip` | `FalloutNVHFR.asi`, `FalloutNVHFR.ini`, `FalloutNVHFR-README.txt` | You already have a 32-bit ASI loader |
-| `FalloutNVHFR-1.0.0-with-ASI-Loader.zip` | The same files, plus Ultimate ASI Loader as `dinput8.dll` and its licence | You have no ASI loader yet |
+| `FalloutNVHFR-1.0.1.zip` | `FalloutNVHFR.asi`, `FalloutNVHFR.ini`, `FalloutNVHFR-README.txt` | You already have a 32-bit ASI loader |
+| `FalloutNVHFR-1.0.1-with-ASI-Loader.zip` | The same files, plus Ultimate ASI Loader as `dinput8.dll` and its licence | You have no ASI loader yet |
 
 ## Why
 
@@ -53,11 +53,13 @@ picture runs faster.
 
 - The player's position and the first- and third-person cameras, including
   crouching, falls, view animation and aiming (field of view)
-- First-person arms and weapon
+- First-person arms and weapon, including aiming down the sights and crouch
+  transitions
 - The player's body in third person
 - Other characters and creatures, including ragdolls
 - Moving objects in the loaded cells, including doors
 - The sky
+- The VATS and kill cameras, including slow motion
 
 Every value written for a draw is put back after the draw, and only if the
 engine has not changed it in the meantime. The engine's state is never left
@@ -133,9 +135,27 @@ at their defaults.
 - Below 60 FPS the game runs slower than real time.
 - With the 9 mm pistol, the weapon shakes for about 300 ms at the start of
   aiming down the sights. The cause has not been found.
-- VATS and kill cameras have not been specifically tested.
 - The "spider hands" bug (stretched fingers at high frame rates) is not
   corrected.
+
+## Changes
+
+**1.0.1**
+
+- First person: the arms and weapon no longer step and trail the view while
+  aiming down the sights or crouching and standing up. The first-person pass
+  is drawn from the interpolated camera bone; it sets its field of view
+  through a function that recomputes the camera from its local transform, so
+  the local transform is written too. The arm skeleton's world transforms are
+  rebuilt from the blended local transforms, checked against each node's
+  parent, because the engine adjusts `Bip01 Spine2` after computing it and
+  rebuilds the skeleton during the render only on some frames.
+- VATS playback and kill cameras: the camera's whole transform is
+  interpolated between ticks.
+
+**1.0.0**
+
+- First release.
 
 ## Building
 
