@@ -1,0 +1,36 @@
+# Reverse engineering material: plan, scripts, captures, references, tools
+/research/
+
+# CMake build trees and generated files
+/build*/
+/out/
+/dist/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Compiler and linker outputs
+*.asi
+*.dll
+*.exe
+*.exp
+*.ilk
+*.lib
+*.obj
+*.pdb
+
+# Runtime telemetry
+FalloutNVHFR.csv
+FalloutNVHFR.log
+
+# IDE and OS metadata
+.vs/
+.vscode/
+*.suo
+*.user
+__pycache__/
+.DS_Store
+Thumbs.db
