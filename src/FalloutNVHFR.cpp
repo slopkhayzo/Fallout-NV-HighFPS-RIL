@@ -29,7 +29,7 @@
 
 namespace {
 
-constexpr char kPatchVersion[] = "1.0.1";
+constexpr char kPatchVersion[] = "1.0.2";
 
 // The build this was developed against (GOG 1.4.0.525). Reported in the log
 // for comparison only; nothing is refused because of it.
@@ -317,6 +317,9 @@ bool g_menuRealTimeEnabled = true;
 bool g_firstPersonPassCameraEnabled = true;
 bool g_firstPersonWorldEnabled = true;
 bool g_killCamCameraEnabled = true;
+bool g_lowRateRulesEnabled = true;
+bool g_latePlayerPositionEnabled = true;
+bool g_killCamTickPosesEnabled = true;
 double g_simulationStepMs = 1000.0 / 60.0;
 double g_maxWallDeltaMs = 250.0;
 
@@ -340,6 +343,15 @@ double g_frameWallDeltaMs = 0.0;
 DWORD g_mainThreadId = 0;
 bool g_frameEligible = false;  // ordinary gameplay: the frame may be frozen
 int g_eligibleFrames = 0;
+// Frames per tick, smoothed over about ten ticks. At up to 2.5 (about 150
+// FPS) there are tick periods with no draw in them that is neither a tick
+// draw nor the draw after one, and two ticks often fall on consecutive
+// draws; the classifiers then use the rules of ClassifyChange. Above it,
+// or with bLowRateRules=0, every decision is the one 1.0.1 made.
+constexpr double kFewDrawsPerTick = 2.5;
+double g_drawsPerTick = 6.0;
+uint32_t g_drawsSinceTick = 0;
+bool g_fewDrawsPerTick = false;
 constexpr int kFreezeWarmUpFrames = 30;
 float g_havokMaxTimeOriginal = 0.0f;
 bool g_havokMaxTimeOverridden = false;
@@ -498,6 +510,24 @@ struct Counters {
     std::atomic<uint32_t> objectCells{0};         // cells in the last walk
     std::atomic<uint32_t> objectActiveMax{0};
     std::atomic<uint32_t> objectControlled{0};
+    // Few draws per tick (see ClassifyChange).
+    std::atomic<uint32_t> drawsPerTickCenti{0};
+    std::atomic<uint64_t> fewDrawFrames{0};
+    std::atomic<uint64_t> fpMixed{0};             // changed on time and late within two draws
+    std::atomic<uint64_t> fpLateAfterTick{0};     // late pose seen on a tick draw after a tick draw
+    std::atomic<uint64_t> bodyMixed{0};
+    std::atomic<uint64_t> bodyLateAfterTick{0};
+    std::atomic<uint64_t> offsetMixed{0};
+    std::atomic<uint64_t> killCamTickPoses{0};    // kill camera blended between tick draws' poses
+    std::atomic<uint64_t> fovLateAfterTick{0};
+    std::atomic<uint64_t> cameraRelationDrift{0}; // relation moved a little: rotation still written
+    std::atomic<uint32_t> cameraRelationMicro{0}; // largest relation change, millionths
+    std::atomic<uint64_t> positionChanges[4]{};    // player position changes by draw kind
+    std::atomic<uint64_t> positionLate{0};         // ... taken as a draw late
+    // Kill camera changes by draws since the tick draw (0 to 3, 4 or more),
+    // all and those beyond the small-change limits.
+    std::atomic<uint64_t> killCamAfterTick[5]{};
+    std::atomic<uint64_t> killCamLargeAfterTick[5]{};
 };
 Counters g_counters;
 int64_t g_lastFrameQpc = 0;
@@ -680,6 +710,16 @@ void FirstFrameCheck() {
     g_firstFrameIntact = true;
 }
 
+void NoteDrawsPerTick(bool tick) {
+    ++g_drawsSinceTick;
+    if (!tick) return;
+    g_drawsPerTick += (static_cast<double>(g_drawsSinceTick) - g_drawsPerTick) * 0.1;
+    g_drawsSinceTick = 0;
+    g_fewDrawsPerTick = g_lowRateRulesEnabled && g_drawsPerTick <= kFewDrawsPerTick;
+    g_counters.drawsPerTickCenti.store(static_cast<uint32_t>(g_drawsPerTick * 100.0),
+                                       std::memory_order_relaxed);
+}
+
 // Advances the accumulator by the wall time since the last frame and decides
 // whether this frame is a tick. At most one tick per frame, and the backlog is
 // bounded, so the engine is never stepped more often than the tick rate.
@@ -705,6 +745,8 @@ void BeginTickFrame() {
         if (g_accumulatorMs > g_simulationStepMs) g_accumulatorMs = g_simulationStepMs;
         g_counters.ticks.fetch_add(1, std::memory_order_relaxed);
     }
+    NoteDrawsPerTick(tick);
+    if (g_fewDrawsPerTick) g_counters.fewDrawFrames.fetch_add(1, std::memory_order_relaxed);
     g_frameTickDecision = tick ? 1 : 0;
     g_counters.accumulatorMicros.store(static_cast<int32_t>(g_accumulatorMs * 1000.0),
                                        std::memory_order_relaxed);
@@ -1003,6 +1045,96 @@ bool RelativePoseDiffers(const NodePose &left, const NodePose &right) {
     return false;
 }
 
+// ---- On time, late, or every frame ----------------------------------------------
+// A value driven by ticks changes either on tick draws (its pose is on time)
+// or on the draw after a tick draw (it arrives a draw late), not on both. The
+// draw kinds: 0 a tick draw after one that was not, 1 the draw after a tick
+// draw, not itself one, 2 a tick draw after a tick draw, 3 neither. A change
+// on kind 0 can only be on time, one on kind 1 only late, one on kind 2
+// either, one on kind 3 neither. With many draws per tick a value driven every
+// frame (by the mouse) shows itself by changing on kind-3 draws, which the
+// off-tick scores count. At about 90 FPS there are none: every draw is a tick
+// draw or the draw after one, two ticks often fall on consecutive draws, and
+// the "draw after a tick" is then the next tick draw. There the evidence is:
+// a change on kind 0 and one on kind 1 within two draws means the value is
+// driven every frame; a late value's change on kind 2 belongs to the tick of
+// the draw before. Both are used only with few draws per tick.
+struct ChangeEvidence {
+    uint32_t lastChange;     // serial of the last change recorded
+    uint32_t onTimeChange;   // ... of the last one on a kind-0 draw
+    uint32_t afterTickChange; // ... on a kind-1 draw
+    uint32_t perFrameUntil;  // tick count up to which the value is shown as it is
+    bool late;               // its last unambiguous change arrived a draw late
+};
+
+struct ChangeDecision {
+    bool late;    // the tick of the draw before: shown with that draw's phase
+    bool offTick; // belongs to no tick
+    bool scores;  // counts towards the off-tick score
+    bool mixed;   // with few draws per tick: driven every frame
+};
+
+void ResetChangeEvidence(ChangeEvidence &evidence, uint32_t serial, uint32_t tickCount) {
+    evidence.lastChange = serial - 100;
+    evidence.onTimeChange = serial - 100;
+    evidence.afterTickChange = serial - 100;
+    evidence.perFrameUntil = tickCount - 100;
+    evidence.late = false;
+}
+
+bool HeldPerFrame(const ChangeEvidence &evidence, uint32_t tickCount) {
+    return static_cast<int32_t>(evidence.perFrameUntil - tickCount) >= 0;
+}
+
+// With many draws per tick a change on a kind-1 draw is late unless the
+// value also changed on the draw before (a kind-0 draw then), which makes it
+// off tick. With few, the draw before may be a kind-2 draw where a late value
+// changed too; it is off tick only if the value changed on a kind-0 draw.
+ChangeDecision ClassifyChange(const ChangeEvidence &evidence, int kind, uint32_t serial) {
+    ChangeDecision decision{};
+    switch (kind) {
+    case 0:
+        decision.mixed = g_fewDrawsPerTick && serial - evidence.afterTickChange <= 2;
+        decision.offTick = decision.mixed;
+        break;
+    case 1: {
+        const bool conflict = g_fewDrawsPerTick ? serial - evidence.onTimeChange <= 2
+                                                : evidence.lastChange + 1 == serial;
+        decision.late = !conflict;
+        decision.offTick = conflict;
+        decision.scores = conflict;
+        decision.mixed = conflict && g_fewDrawsPerTick;
+        break;
+    }
+    case 2:
+        decision.late = g_fewDrawsPerTick && evidence.late;
+        break;
+    default:
+        decision.offTick = true;
+        decision.scores = true;
+        break;
+    }
+    return decision;
+}
+
+void RecordChange(ChangeEvidence &evidence, int kind, uint32_t serial, uint32_t tickCount,
+                  const ChangeDecision &decision) {
+    evidence.lastChange = serial;
+    if (kind == 0) {
+        // A change on a draw where only an on-time pose can arrive clears a
+        // late one taken from a stray change before it.
+        evidence.onTimeChange = serial;
+        evidence.late = false;
+    } else if (kind == 1) {
+        evidence.afterTickChange = serial;
+        if (decision.late) evidence.late = true;
+    }
+    // Until the end of the next tick period. At 90 FPS a value driven every
+    // frame gives evidence on each kind-1 draw and the kind-0 draw after it,
+    // so this lasts until the next.
+    if (decision.mixed) evidence.perFrameUntil = tickCount + 1;
+}
+
 // ---- Sky ---------------------------------------------------------------------
 // The sky is re-centred on the camera once per tick. When the camera is moved
 // for a draw the sky has to move by the same amount, or it shifts against the
@@ -1099,25 +1231,36 @@ struct TickTrack {
     float to;
     uint8_t score;
     bool valid;
+    ChangeEvidence evidence;
 };
 TickTrack g_thirdPersonTracks[3]{};
+uint32_t g_thirdPersonSerial = 1;
+uint32_t g_thirdPersonTickCount = 0;
+bool g_thirdPersonPreviousWasTick = false;
 
-float AdvanceTickTrack(TickTrack &track, float value, bool tick, double alpha,
+float AdvanceTickTrack(TickTrack &track, float value, bool tick, int frameKind, double alpha,
                        float tolerance) {
     if (track.score != 0) --track.score;
     if (!track.valid || !std::isfinite(value)) {
         track.from = track.to = value;
         track.valid = std::isfinite(value);
         track.score = 0;
+        ResetChangeEvidence(track.evidence, g_thirdPersonSerial, g_thirdPersonTickCount);
         return value;
     }
     const float step = std::fabs(value - track.to);
     if (step > tolerance) {
+        const ChangeDecision decision =
+            ClassifyChange(track.evidence, frameKind, g_thirdPersonSerial);
+        RecordChange(track.evidence, frameKind, g_thirdPersonSerial, g_thirdPersonTickCount,
+                     decision);
+        if (decision.mixed) g_counters.offsetMixed.fetch_add(1, std::memory_order_relaxed);
         if (!tick) {
             track.score = static_cast<uint8_t>(track.score > 12 ? 16 : track.score + 4);
             track.from = value;
             g_counters.thirdPersonOffTick.fetch_add(1, std::memory_order_relaxed);
-        } else if (track.score >= 8 || step > 40.0f) {
+        } else if (track.score >= 8 || step > 40.0f ||
+                   HeldPerFrame(track.evidence, g_thirdPersonTickCount)) {
             track.from = value;
         } else {
             track.from = track.to;
@@ -1136,6 +1279,11 @@ bool ThirdPersonCameraDelta(uintptr_t camera, const float cameraPosition[3],
                             const float playerPosition[3], bool tick, double alpha,
                             float delta[3]) {
     delta[0] = delta[1] = delta[2] = 0.0f;
+    ++g_thirdPersonSerial;
+    if (tick) ++g_thirdPersonTickCount;
+    const int frameKind =
+        tick ? (g_thirdPersonPreviousWasTick ? 2 : 0) : (g_thirdPersonPreviousWasTick ? 1 : 3);
+    g_thirdPersonPreviousWasTick = tick;
     const float *rotation = reinterpret_cast<const float *>(camera + kNodeWorldTransform);
     const float forward[3] = {rotation[0], rotation[3], rotation[6]};
     // right = up x forward, horizontal; undefined when the view is straight
@@ -1161,8 +1309,8 @@ bool ThirdPersonCameraDelta(uintptr_t camera, const float cameraPosition[3],
     const float engineValues[3] = {height, back, side};
     float shownValues[3];
     for (int index = 0; index < 3; ++index) {
-        shownValues[index] =
-            AdvanceTickTrack(g_thirdPersonTracks[index], engineValues[index], tick, alpha, 0.01f);
+        shownValues[index] = AdvanceTickTrack(g_thirdPersonTracks[index], engineValues[index],
+                                              tick, frameKind, alpha, 0.01f);
     }
     const float dHeight = shownValues[0] - height;
     const float dBack = shownValues[1] - back;
@@ -1187,7 +1335,7 @@ struct BodyPoseHistory {
     uint32_t changePeriod;
     uint8_t offTickScore; // +4 per off-tick change, -1 per draw
     bool lag;             // the last change arrived on the draw after its tick
-    uint32_t lastChange;  // draw serial of the last change
+    ChangeEvidence evidence;
     NodePose from;
     NodePose to;
 };
@@ -1233,9 +1381,9 @@ BodyPoseHistory *FindBodyHistory(uintptr_t object) {
 // Advances one node's history with this draw's parent-relative pose and
 // returns the pose to show. `blended` says whether it differs from the
 // engine's.
-void AdvanceBodyNode(uintptr_t object, const NodePose &relative, bool frameIsTick,
-                     int frameKind, uint32_t ticksBefore, double frameAlpha,
-                     double previousAlpha, NodePose &shownRelative, bool &blended) {
+void AdvanceBodyNode(uintptr_t object, const NodePose &relative, int frameKind,
+                     uint32_t ticksBefore, double frameAlpha, double previousAlpha,
+                     NodePose &shownRelative, bool &blended) {
     shownRelative = relative;
     blended = false;
     BodyPoseHistory *history = FindBodyHistory(object);
@@ -1248,6 +1396,7 @@ void AdvanceBodyNode(uintptr_t object, const NodePose &relative, bool frameIsTic
         history->to = relative;
         history->changePeriod = 0;
         history->offTickScore = 0;
+        ResetChangeEvidence(history->evidence, g_bodySerial, g_bodyTickCount);
         return;
     }
     if (history->offTickScore != 0) --history->offTickScore;
@@ -1256,11 +1405,11 @@ void AdvanceBodyNode(uintptr_t object, const NodePose &relative, bool frameIsTic
         // A pose arrives either on the tick draw or on the draw after it. A
         // change on the draw after a tick counts as that tick's, unless the
         // node also changed on the tick draw itself, which means it moves
-        // every frame.
-        const bool changedLastDraw = history->lastChange + 1 == g_bodySerial;
-        history->lastChange = g_bodySerial;
-        const bool lagged = frameKind == 1 && !changedLastDraw;
-        bool offTick = !frameIsTick && !lagged;
+        // every frame. With few draws per tick, see ClassifyChange.
+        const ChangeDecision decision =
+            ClassifyChange(history->evidence, frameKind, g_bodySerial);
+        const bool lagged = decision.late;
+        const bool offTick = decision.offTick;
         bool minor = false;
         if (offTick) {
             // Foot placement re-solves the legs whenever the body turns,
@@ -1277,17 +1426,22 @@ void AdvanceBodyNode(uintptr_t object, const NodePose &relative, bool frameIsTic
             }
             if (rotationStep <= 0.03f && translationStep <= 0.5f) {
                 g_counters.bodyMinor.fetch_add(1, std::memory_order_relaxed);
-                history->lastChange = g_bodySerial - 1;
                 minor = true;
             }
         }
         if (!minor) {
-            if (offTick) {
+            RecordChange(history->evidence, frameKind, g_bodySerial, g_bodyTickCount, decision);
+            if (decision.mixed) g_counters.bodyMixed.fetch_add(1, std::memory_order_relaxed);
+            if (frameKind == 2 && lagged) {
+                g_counters.bodyLateAfterTick.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (decision.scores) {
                 history->offTickScore = static_cast<uint8_t>(
                     history->offTickScore > 12 ? 16 : history->offTickScore + 4);
-                g_counters.bodyOffTick.fetch_add(1, std::memory_order_relaxed);
             }
-            if (offTick || history->offTickScore >= 8) {
+            if (offTick) g_counters.bodyOffTick.fetch_add(1, std::memory_order_relaxed);
+            if (offTick || history->offTickScore >= 8 ||
+                HeldPerFrame(history->evidence, g_bodyTickCount)) {
                 history->from = relative;
                 history->to = relative;
                 history->changePeriod = 0;
@@ -1379,8 +1533,8 @@ bool ApplyPlayerBodyPose(uintptr_t player, const float playerPosition[3],
                 NodePose relative;
                 RelativePose(parentEngine, engine, relative);
                 NodePose shownRelative;
-                AdvanceBodyNode(object, relative, frameIsTick, frameKind, ticksBefore,
-                                frameAlpha, previousAlpha, shownRelative, blended);
+                AdvanceBodyNode(object, relative, frameKind, ticksBefore, frameAlpha,
+                                previousAlpha, shownRelative, blended);
                 ComposePose(parentShown, shownRelative, shown);
             }
             const bool moved = parentMoved || blended;
@@ -1430,11 +1584,11 @@ bool ApplyPlayerBodyPose(uintptr_t player, const float playerPosition[3],
 struct FirstPersonLocalHistory {
     uintptr_t node;
     uint32_t lastSeen;
-    uint32_t lastChange;    // serial of the last change
     uint8_t offTickScore;   // +4 per off-tick change, -1 per render
     bool lastChangeLagged;  // the previous change came a draw after its tick
     uint32_t changePeriod;  // tick period the last change belongs to
     bool lag;               // change first seen on the frame after its tick
+    ChangeEvidence evidence;
     NodePose from;
     NodePose to;
 };
@@ -1465,13 +1619,97 @@ SavedNodePose g_fpWorldSaved[1024];
 size_t g_fpWorldSavedCount = 0;
 void WriteFirstPersonWorlds();
 
+// Where a render is relative to the ticks.
+struct RenderPhase {
+    uint32_t serial;
+    uint32_t tickCount;   // ticks up to and including this render
+    uint32_t ticksBefore; // ... up to the render before
+    int kind;             // see ClassifyChange
+    double alpha;
+    double previousAlpha;
+};
+
+// Advances one node's history with this render's local transform. Returns
+// what was decided about a change on this render, as the aim trace numbers
+// it (0 no change, 1 accepted on the tick draw, 2 accepted late, 3 shown as
+// is: off tick, 4 shown as is: driven every frame, 5 shown as is: first late
+// pose). `tooBig` is set when a blend is in progress but its step is above 30
+// units; `blend` when `shown` holds the pose to show.
+uint8_t AdvanceFirstPersonNode(FirstPersonLocalHistory &history, const NodePose &current,
+                               const RenderPhase &phase, bool &tooBig, NodePose &shown,
+                               bool &blend) {
+    tooBig = false;
+    blend = false;
+    uint8_t decision = 0;
+    if (history.offTickScore != 0) --history.offTickScore;
+    if (memcmp(history.to.value, current.value, sizeof(current.value)) != 0) {
+        g_counters.fpChanges[phase.kind].fetch_add(1, std::memory_order_relaxed);
+        // Animation moves a node on tick frames only. A node that keeps
+        // changing on other frames as well is being driven every frame (the
+        // pitch-following nodes while the mouse moves); blending it would
+        // make it trail the view. A single off-tick change is shown as it is
+        // without reclassifying the node. A change on the draw after a tick,
+        // with none on the tick draw before it, is a late pose: the first one
+        // is shown as it is, and from the second in a row the node is blended
+        // with the previous draw's phase. With few draws per tick, see
+        // ClassifyChange.
+        const ChangeDecision change =
+            ClassifyChange(history.evidence, phase.kind, phase.serial);
+        RecordChange(history.evidence, phase.kind, phase.serial, phase.tickCount, change);
+        if (change.mixed) g_counters.fpMixed.fetch_add(1, std::memory_order_relaxed);
+        const bool latePose = change.late;
+        const bool offTick = change.offTick;
+        const bool blendLate = latePose && history.lastChangeLagged;
+        history.lastChangeLagged = latePose;
+        if (change.scores) {
+            history.offTickScore = static_cast<uint8_t>(
+                history.offTickScore > 12 ? 16 : history.offTickScore + 4);
+        }
+        const bool perFrame = history.offTickScore >= 8 ||
+                              HeldPerFrame(history.evidence, phase.tickCount);
+        if (blendLate && !perFrame) {
+            g_counters.fpLateBlends.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (offTick || perFrame || (latePose && !blendLate)) {
+            g_counters.fpPerFrame.fetch_add(1, std::memory_order_relaxed);
+            history.from = current;
+            history.to = current;
+            history.changePeriod = 0;
+            return offTick ? 3 : (perFrame ? 4 : 5);
+        }
+        if (phase.kind == 2 && latePose) {
+            g_counters.fpLateAfterTick.fetch_add(1, std::memory_order_relaxed);
+        }
+        history.from = history.to;
+        history.to = current;
+        history.lag = latePose;
+        history.changePeriod = latePose ? phase.ticksBefore : phase.tickCount;
+        decision = latePose ? 2 : 1;
+    }
+    const uint32_t period = history.lag ? phase.ticksBefore : phase.tickCount;
+    if (history.changePeriod == 0 || history.changePeriod != period) return decision;
+    float stepSquared = 0.0f;
+    for (size_t axis = 9; axis < 12; ++axis) {
+        const float delta = history.to.value[axis] - history.from.value[axis];
+        stepSquared += delta * delta;
+    }
+    if (!(stepSquared <= 900.0f)) {
+        tooBig = true;
+        return decision;
+    }
+    blend = BlendPose(history.from, history.to,
+                      history.lag ? phase.previousAlpha : phase.alpha, shown);
+    return decision;
+}
+
 // ---- Field of view ------------------------------------------------------------
 struct FovTrack {
     float from;
     float to;
     float shown;
     bool valid;
-    bool lag; // change first seen on the frame after its tick
+    bool lag;  // change first seen on the frame after its tick
+    bool late; // its last change on a kind-0 or kind-1 draw (see ClassifyChange) was late
     uint32_t changePeriod;
 };
 FovTrack g_fovTracks[3]{};
@@ -1499,6 +1737,7 @@ void UpdateFovTracks(uintptr_t player) {
             track.from = track.to = track.shown = engine;
             track.valid = std::isfinite(engine);
             track.changePeriod = 0;
+            track.late = false;
             continue;
         }
         if (engine != track.to) {
@@ -1509,10 +1748,16 @@ void UpdateFovTracks(uintptr_t player) {
                 track.changePeriod = 0;
                 g_counters.fovAsIs.fetch_add(1, std::memory_order_relaxed);
             } else {
+                // On a tick draw after a tick draw the change is either that
+                // tick's or, if the values arrive a draw late, the one before.
+                if (frameIsTick != previousWasTick) track.late = !frameIsTick;
                 track.from = track.to;
                 track.to = engine;
-                track.lag = !frameIsTick;
+                track.lag = !frameIsTick || (previousWasTick && g_fewDrawsPerTick && track.late);
                 track.changePeriod = track.lag ? ticksBefore : g_fovTickCount;
+                if (frameIsTick && track.lag) {
+                    g_counters.fovLateAfterTick.fetch_add(1, std::memory_order_relaxed);
+                }
                 g_counters.fovSteps.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -1689,6 +1934,8 @@ void FirstPersonAdvance(uintptr_t player, bool frameIsTick, double frameAlpha) {
         ++g_fpSerial;
         const int frameKind =
             frameIsTick ? (previousWasTick ? 2 : 0) : (previousWasTick ? 1 : 3);
+        const RenderPhase phase{g_fpSerial, g_fpTickCount, ticksBefore,
+                                frameKind,  frameAlpha,    previousAlpha};
         const bool tracing = g_fpTraceEnabled && g_fpTraceHot != 0;
         static FpTraceRow row;
         if (tracing) {
@@ -1747,80 +1994,31 @@ void FirstPersonAdvance(uintptr_t player, bool frameIsTick, double frameAlpha) {
             if (!known) {
                 history->from = current;
                 history->to = current;
-                history->lastChange = 0;
                 history->offTickScore = 0;
                 history->changePeriod = 0;
                 history->lastChangeLagged = false;
+                ResetChangeEvidence(history->evidence, g_fpSerial, g_fpTickCount);
                 continue;
             }
-            if (history->offTickScore != 0) --history->offTickScore;
-            if (memcmp(history->to.value, current.value, sizeof(current.value)) != 0) {
-                g_counters.fpChanges[frameKind].fetch_add(1, std::memory_order_relaxed);
-                const bool changedLastPass = history->lastChange + 1 == g_fpSerial;
-                history->lastChange = g_fpSerial;
-                // Animation moves a node on tick frames only. A node that
-                // keeps changing on other frames as well is being driven
-                // every frame (the pitch-following nodes while the mouse
-                // moves); blending it would make it trail the view. A single
-                // off-tick change is shown as it is without reclassifying
-                // the node. A change on the draw after a tick, with none on
-                // the tick draw before it, is a late pose: the first one is
-                // shown as it is, and from the second in a row the node is
-                // blended with the previous draw's phase.
-                const bool latePose = frameKind == 1 && !changedLastPass;
-                const bool offTick = (frameKind == 1 && !latePose) || frameKind == 3;
-                const bool blendLate = latePose && history->lastChangeLagged;
-                history->lastChangeLagged = latePose;
-                if (offTick) {
-                    history->offTickScore = static_cast<uint8_t>(
-                        history->offTickScore > 12 ? 16 : history->offTickScore + 4);
-                }
-                const bool perFrame = history->offTickScore >= 8;
-                if (blendLate && !perFrame) {
-                    g_counters.fpLateBlends.fetch_add(1, std::memory_order_relaxed);
-                }
-                if (tracing) ++row.counts[0];
-                if (offTick || perFrame || (latePose && !blendLate)) {
-                    g_counters.fpPerFrame.fetch_add(1, std::memory_order_relaxed);
-                    if (tracing) {
-                        const uint8_t decision = offTick ? 3 : (perFrame ? 4 : 5);
-                        ++row.counts[decision];
-                        NoteNode(row, object, decision, history->to, current);
-                    }
-                    history->from = current;
-                    history->to = current;
-                    history->changePeriod = 0;
-                    continue;
-                }
-                history->from = history->to;
-                history->to = current;
-                history->lag = !frameIsTick;
-                history->changePeriod = history->lag ? ticksBefore : g_fpTickCount;
-                if (tracing) {
-                    const uint8_t decision = history->lag ? 2 : 1;
+            NodePose previousTo{};
+            if (tracing) previousTo = history->to;
+            bool tooBig = false;
+            bool blend = false;
+            NodePose shown;
+            const uint8_t decision =
+                AdvanceFirstPersonNode(*history, current, phase, tooBig, shown, blend);
+            if (tracing) {
+                if (decision != 0) {
+                    ++row.counts[0];
                     ++row.counts[decision];
-                    NoteNode(row, object, decision, history->from, history->to);
+                    NoteNode(row, object, decision, previousTo, current);
                 }
-            }
-            const uint32_t period = history->lag ? ticksBefore : g_fpTickCount;
-            if (history->changePeriod == 0 || history->changePeriod != period) continue;
-            float stepSquared = 0.0f;
-            for (size_t axis = 9; axis < 12; ++axis) {
-                const float delta = history->to.value[axis] - history->from.value[axis];
-                stepSquared += delta * delta;
-            }
-            if (!(stepSquared <= 900.0f)) {
-                if (tracing) {
+                if (tooBig) {
                     ++row.counts[6];
                     NoteNode(row, object, 6, history->from, history->to);
                 }
-                continue;
             }
-            NodePose shown;
-            if (!BlendPose(history->from, history->to, history->lag ? previousAlpha : frameAlpha,
-                           shown)) {
-                continue;
-            }
+            if (!blend) continue;
             if (g_fpPendingCount >= 512) continue;
             if (tracing) ++row.counts[7];
             SavedNodePose &pending = g_fpPending[g_fpPendingCount++];
@@ -2415,8 +2613,14 @@ bool ApplyCameraAnimationRotation(uintptr_t camera) {
         memcpy(saved.original, reinterpret_cast<const void *>(camera + kNodeWorldTransform),
                sizeof(saved.original));
         // The camera is expected to be the bone's rotation times a constant.
-        // If that relation moves, the camera is not following the bone (or
-        // not yet), and nothing is written on this frame.
+        // If that relation jumps, the camera is not following the bone (or
+        // not yet), and nothing is written on this frame. It also moves by
+        // small amounts from one frame to the next while the view turns, more
+        // the longer the frame (about 5 % of renders at 300 FPS, 7 % at 175
+        // in the logs). Skipping such a frame shows the engine's rotation on
+        // it: a one-frame twitch of the view and the arms as large as the
+        // blend. With few draws per tick those frames are written like any
+        // other and only a jump skips one.
         float relation[9];
         MultiplyRotation(engineWorldInverse, saved.original, relation);
         float deviation = 0.0f;
@@ -2426,12 +2630,18 @@ bool ApplyCameraAnimationRotation(uintptr_t camera) {
             if (difference > deviation) deviation = difference;
         }
         if (!g_cameraBoneRelationValid || deviation > 0.002f) {
+            const bool jump = !g_cameraBoneRelationValid || !g_fewDrawsPerTick ||
+                              !(deviation <= 0.1f);
             if (g_cameraBoneRelationValid) {
-                g_counters.cameraRelationChanges.fetch_add(1, std::memory_order_relaxed);
+                (jump ? g_counters.cameraRelationChanges : g_counters.cameraRelationDrift)
+                    .fetch_add(1, std::memory_order_relaxed);
+                AtomicMax(g_counters.cameraRelationMicro,
+                          std::isfinite(deviation) && deviation < 4.0e3f
+                              ? static_cast<uint32_t>(deviation * 1.0e6f) : 0xFFFFFFFFu);
             }
             memcpy(g_cameraBoneRelation, relation, sizeof(relation));
             g_cameraBoneRelationValid = true;
-            return false;
+            if (jump) return false;
         }
         if (!anyBlended) return false;
 
@@ -3112,12 +3322,26 @@ bool ApplyActorPoses(uintptr_t player, bool frameIsTick, double frameAlpha, bool
 
 // ---- The draw ----------------------------------------------------------------
 
+// The player's position changes on tick draws in ordinary play (measured
+// in the open world). While the player dies it changes on the draw after the
+// tick draw instead (measured 2026-10-15: 161 of 177 changes at 350 FPS);
+// blended as if on time, it moved the body root at the wrong phase, a small
+// hitch at every tick at 350 FPS and steps of whole ticks at 90. Each change
+// is classified as the body's nodes are (ClassifyChange), and a late one is
+// shown with the phase of the draw before.
 struct PositionHistory {
     bool valid;
+    bool lag;              // the last change arrived on the draw after its tick
+    uint32_t changePeriod; // tick period the from/to pair belongs to
+    ChangeEvidence evidence;
     float from[3];
     float to[3];
 };
 PositionHistory g_playerHistory{};
+uint32_t g_positionSerial = 1;
+uint32_t g_positionTickCount = 0;
+bool g_positionPreviousWasTick = false;
+double g_positionPreviousAlpha = 0.0;
 uint32_t g_cameraEligibleDraws = 0;
 float g_lastCameraPosition[3]{};
 bool g_lastCameraPositionValid = false;
@@ -3136,22 +3360,88 @@ constexpr float kTeleportDistanceSquared = 22500.0f;
 // shown with the previous draw's phase; a small change on any other draw is
 // let through (the next tick's pose includes it); a large one means it is
 // driven every frame and it is shown as it is for a while; a cut is shown at
-// once.
+// once. That is 1.0.1's rule, kept behind bKillCamTickPoses=0 above 150 FPS.
+// The rule used now: the camera as it is on each tick draw is that tick's
+// pose, and a change up to two draws after a tick draw is left to the next
+// tick draw's pose. With few draws per tick the draw after a tick draw is
+// often the next tick draw, where the two changes cannot be told apart by
+// draw. The death camera (2026-10-15, 350 FPS) moves on the tick draw and
+// one and two draws after it (318, 129 and 129 changes in 5 s, none later),
+// following the dying player, whose pose arrives late; the old rule showed
+// the change two draws after as it is when it was large (up to 70 units),
+// and the camera stepped. A large change later than that means the camera
+// moves every frame: it is then shown as it is until a draw on which it
+// does not move by a large amount.
+constexpr uint32_t kKillCamLateDraws = 2;
 struct CameraTrack {
     bool valid;
     bool lag;
+    bool tickPoses;      // the camera on each tick draw is that tick's pose
+    bool perFrame;       // moves every frame: shown as it is
     uint8_t offTickScore;
     uint32_t lastSeen;
     uint32_t changePeriod;
     NodePose from;
     NodePose to;
     NodePose periodFrom; // what was shown before this tick's first change
+    NodePose last;       // the camera as the draw before saw it
 };
 CameraTrack g_killCamTrack{};
 uint32_t g_killCamSerial = 1;
+uint32_t g_killCamDrawsSinceTick = 0;
 uint32_t g_killCamTickCount = 0;
 bool g_killCamPreviousWasTick = false;
 double g_killCamPreviousAlpha = 0.0;
+
+// Advances the player's position history with this draw's position and
+// returns the position to show.
+void AdvancePlayerPosition(const float current[3], bool tick, double alpha, double shown[3]) {
+    const uint32_t ticksBefore = g_positionTickCount;
+    if (tick) ++g_positionTickCount;
+    ++g_positionSerial;
+    const int kind =
+        tick ? (g_positionPreviousWasTick ? 2 : 0) : (g_positionPreviousWasTick ? 1 : 3);
+    const double previousAlpha = g_positionPreviousAlpha;
+    g_positionPreviousWasTick = tick;
+    g_positionPreviousAlpha = alpha;
+    PositionHistory &history = g_playerHistory;
+    if (!history.valid) {
+        memcpy(history.from, current, sizeof(history.from));
+        memcpy(history.to, current, sizeof(history.to));
+        history.valid = true;
+        history.lag = false;
+        history.changePeriod = 0;
+        ResetChangeEvidence(history.evidence, g_positionSerial, g_positionTickCount);
+    } else if (DistanceSquared(current, history.to) > 1.0e-6f) {
+        const ChangeDecision decision = ClassifyChange(history.evidence, kind, g_positionSerial);
+        RecordChange(history.evidence, kind, g_positionSerial, g_positionTickCount, decision);
+        const bool late = decision.late && g_latePlayerPositionEnabled;
+        if (DistanceSquared(current, history.to) <= kTeleportDistanceSquared) {
+            memcpy(history.from, history.to, sizeof(history.from));
+        } else {
+            memcpy(history.from, current, sizeof(history.from));
+            g_counters.snaps.fetch_add(1, std::memory_order_relaxed);
+        }
+        memcpy(history.to, current, sizeof(history.to));
+        history.lag = late;
+        history.changePeriod = late ? ticksBefore : g_positionTickCount;
+        (tick ? g_counters.playerPosesOnTick : g_counters.playerPosesOffTick)
+            .fetch_add(1, std::memory_order_relaxed);
+        g_counters.positionChanges[kind].fetch_add(1, std::memory_order_relaxed);
+        if (late) g_counters.positionLate.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Outside the pair's tick period (a tick that did not move the player)
+    // the position is where the last change put it.
+    const uint32_t period = history.lag ? ticksBefore : g_positionTickCount;
+    const bool blending = history.changePeriod == period;
+    const double phase = history.lag ? previousAlpha : alpha;
+    for (int axis = 0; axis < 3; ++axis) {
+        shown[axis] = blending ? static_cast<double>(history.from[axis]) +
+                                     (static_cast<double>(history.to[axis]) - history.from[axis]) *
+                                         phase
+                               : static_cast<double>(history.to[axis]);
+    }
+}
 
 bool InVatsPlayback() {
     return *reinterpret_cast<const uint32_t *>(kVatsCameraData + kVatsCameraMode) ==
@@ -3169,6 +3459,11 @@ bool AdvanceKillCamTrack(uintptr_t camera, bool active, bool tick, double alpha,
     g_killCamPreviousWasTick = tick;
     g_killCamPreviousAlpha = alpha;
     ++g_killCamSerial;
+    if (tick) {
+        g_killCamDrawsSinceTick = 0;
+    } else if (g_killCamDrawsSinceTick < 1000) {
+        ++g_killCamDrawsSinceTick;
+    }
     CameraTrack &track = g_killCamTrack;
     if (!active) {
         track.valid = false;
@@ -3178,15 +3473,90 @@ bool AdvanceKillCamTrack(uintptr_t camera, bool active, bool tick, double alpha,
     NodePose current;
     memcpy(current.value, reinterpret_cast<const void *>(camera + kNodeWorldTransform),
            sizeof(current.value));
-    if (!track.valid || track.lastSeen + 1 != g_killCamSerial) {
+    const bool tickPoses = g_killCamTickPosesEnabled || g_fewDrawsPerTick;
+    if (!track.valid || track.lastSeen + 1 != g_killCamSerial || track.tickPoses != tickPoses) {
         track = {};
         track.valid = true;
+        track.tickPoses = tickPoses;
         track.lastSeen = g_killCamSerial;
-        track.from = track.to = track.periodFrom = current;
+        track.from = track.to = track.periodFrom = track.last = current;
         return false;
     }
     track.lastSeen = g_killCamSerial;
     if (track.offTickScore != 0) --track.offTickScore;
+    // Diagnostic: how many draws after the tick draw the camera moves, and
+    // by how much, to tell parts that arrive late from motion every frame.
+    if (memcmp(track.last.value, current.value, 12 * sizeof(float)) != 0) {
+        float turn = 0.0f;
+        for (size_t index = 0; index < 9; ++index) {
+            const float difference = std::fabs(current.value[index] - track.last.value[index]);
+            if (!(difference <= turn)) turn = difference;
+        }
+        const float moveSquared = DistanceSquared(&current.value[9], &track.last.value[9]);
+        const size_t slot = g_killCamDrawsSinceTick < 4 ? g_killCamDrawsSinceTick : 4;
+        g_counters.killCamAfterTick[slot].fetch_add(1, std::memory_order_relaxed);
+        if (!(turn <= 0.002f) || !(moveSquared <= 0.25f * 0.25f)) {
+            g_counters.killCamLargeAfterTick[slot].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!track.tickPoses) track.last = current;
+    if (track.tickPoses) {
+        const NodePose previous = track.last;
+        track.last = current;
+        const bool changed = memcmp(previous.value, current.value, 12 * sizeof(float)) != 0;
+        float turn = 0.0f;
+        float move = 0.0f;
+        if (changed) {
+            g_counters.killCamChanges[frameKind].fetch_add(1, std::memory_order_relaxed);
+            for (size_t index = 0; index < 9; ++index) {
+                const float difference = std::fabs(current.value[index] - previous.value[index]);
+                if (!(difference <= turn)) turn = difference;
+            }
+            const float moveSquared = DistanceSquared(&current.value[9], &previous.value[9]);
+            move = std::sqrt(moveSquared);
+            const bool nearTick = frameKind != 3;
+            AtomicMax(nearTick ? g_counters.killCamTickMoveMilli : g_counters.killCamOffMoveMilli,
+                      std::isfinite(move) && move < 4.0e6f ? static_cast<uint32_t>(move * 1000.0f)
+                                                           : 0xFFFFFFFFu);
+            AtomicMax(nearTick ? g_counters.killCamTickTurnMicro : g_counters.killCamOffTurnMicro,
+                      std::isfinite(turn) && turn < 4.0e3f ? static_cast<uint32_t>(turn * 1.0e6f)
+                                                           : 0xFFFFFFFFu);
+            if (!(moveSquared <= kTeleportDistanceSquared) || !(turn <= 0.5f)) {
+                g_counters.killCamSnaps.fetch_add(1, std::memory_order_relaxed);
+                track.from = track.to = current;
+                track.perFrame = false;
+                return false;
+            }
+        }
+        const bool large = changed && (!(turn <= 0.002f) || !(move <= 0.25f));
+        if (track.perFrame) {
+            if (large) {
+                g_counters.killCamAsIs.fetch_add(1, std::memory_order_relaxed);
+                track.from = track.to = current;
+                return false;
+            }
+            track.perFrame = false;
+            track.from = track.to = current;
+        }
+        if (tick) {
+            track.from = track.to;
+            track.to = current;
+            g_counters.killCamTickPoses.fetch_add(1, std::memory_order_relaxed);
+        } else if (changed) {
+            if (g_killCamDrawsSinceTick <= kKillCamLateDraws) {
+                g_counters.killCamLate.fetch_add(1, std::memory_order_relaxed);
+            } else if (!large) {
+                g_counters.killCamMinor.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                track.perFrame = true;
+                g_counters.killCamAsIs.fetch_add(1, std::memory_order_relaxed);
+                track.from = track.to = current;
+                return false;
+            }
+        }
+        if (!BlendPose(track.from, track.to, alpha, shown)) return false;
+        return memcmp(shown.value, current.value, 12 * sizeof(float)) != 0;
+    }
     if (memcmp(track.to.value, current.value, 12 * sizeof(float)) != 0) {
         g_counters.killCamChanges[frameKind].fetch_add(1, std::memory_order_relaxed);
         float turn = 0.0f;
@@ -3323,25 +3693,8 @@ void PrepareDraw(DrawWrites &writes) {
         memcpy(g_lastCameraPosition, writes.cameraEngine, sizeof(g_lastCameraPosition));
         g_lastCameraPositionValid = true;
 
-        PositionHistory &history = g_playerHistory;
-        if (!history.valid) {
-            memcpy(history.from, current, sizeof(current));
-            memcpy(history.to, current, sizeof(current));
-            history.valid = true;
-        } else if (DistanceSquared(current, history.to) > 1.0e-6f) {
-            if (DistanceSquared(current, history.to) <= kTeleportDistanceSquared) {
-                memcpy(history.from, history.to, sizeof(current));
-            } else {
-                memcpy(history.from, current, sizeof(current));
-                g_counters.snaps.fetch_add(1, std::memory_order_relaxed);
-            }
-            memcpy(history.to, current, sizeof(current));
-            (tick ? g_counters.playerPosesOnTick : g_counters.playerPosesOffTick)
-                .fetch_add(1, std::memory_order_relaxed);
-        } else if (tick) {
-            // A tick that did not move the player.
-            memcpy(history.from, history.to, sizeof(current));
-        }
+        double shownPosition[3];
+        AdvancePlayerPosition(current, tick, alpha, shownPosition);
         tracking = true;
         ++g_cameraEligibleDraws;
         warm = g_cameraEligibleDraws > kCameraWarmUpDraws;
@@ -3362,9 +3715,7 @@ void PrepareDraw(DrawWrites &writes) {
             float squared = 0.0f;
             bool finite = true;
             for (int axis = 0; axis < 3; ++axis) {
-                const double shown = static_cast<double>(history.from[axis]) +
-                    (static_cast<double>(history.to[axis]) - history.from[axis]) * alpha;
-                correction[axis] = static_cast<float>(shown - current[axis]);
+                correction[axis] = static_cast<float>(shownPosition[axis] - current[axis]);
                 squared += correction[axis] * correction[axis];
                 finite = finite && std::isfinite(correction[axis]);
             }
@@ -4023,6 +4374,53 @@ DWORD WINAPI LogThread(LPVOID) {
                 now[9] - last[9], now[10] - last[10]);
             memcpy(last, now, sizeof(last));
         }
+        {
+            static uint64_t last[10]{};
+            const uint64_t now[10] = {
+                g_counters.fewDrawFrames.load(std::memory_order_relaxed),
+                g_counters.fpMixed.load(std::memory_order_relaxed),
+                g_counters.fpLateAfterTick.load(std::memory_order_relaxed),
+                g_counters.bodyMixed.load(std::memory_order_relaxed),
+                g_counters.bodyLateAfterTick.load(std::memory_order_relaxed),
+                g_counters.offsetMixed.load(std::memory_order_relaxed),
+                g_counters.killCamTickPoses.load(std::memory_order_relaxed),
+                g_counters.fovLateAfterTick.load(std::memory_order_relaxed),
+                g_counters.cameraRelationDrift.load(std::memory_order_relaxed),
+                g_counters.cameraRelationChanges.load(std::memory_order_relaxed)};
+            AppendStatus(
+                "phase draws_per_tick=%.2f few_draw_frames=%llu | first mixed=%llu "
+                "late_after_tick=%llu | body mixed=%llu late_after_tick=%llu | offset "
+                "mixed=%llu | killcam tick_poses=%llu | fov late_after_tick=%llu | relation "
+                "drift_written=%llu jumps=%llu largest=%.6f",
+                g_counters.drawsPerTickCenti.load(std::memory_order_relaxed) / 100.0,
+                now[0] - last[0], now[1] - last[1], now[2] - last[2],
+                now[3] - last[3], now[4] - last[4], now[5] - last[5], now[6] - last[6],
+                now[7] - last[7], now[8] - last[8], now[9] - last[9],
+                g_counters.cameraRelationMicro.exchange(0, std::memory_order_relaxed) / 1.0e6);
+            memcpy(last, now, sizeof(last));
+        }
+        {
+            static uint64_t last[15]{};
+            uint64_t now[15];
+            for (size_t index = 0; index < 4; ++index) {
+                now[index] = g_counters.positionChanges[index].load(std::memory_order_relaxed);
+            }
+            now[4] = g_counters.positionLate.load(std::memory_order_relaxed);
+            for (size_t index = 0; index < 5; ++index) {
+                now[5 + index] = g_counters.killCamAfterTick[index].load(std::memory_order_relaxed);
+                now[10 + index] =
+                    g_counters.killCamLargeAfterTick[index].load(std::memory_order_relaxed);
+            }
+            AppendStatus(
+                "position changes by kind %llu/%llu/%llu/%llu late=%llu | killcam changes by draws "
+                "after the tick 0/1/2/3/4+ all %llu/%llu/%llu/%llu/%llu large "
+                "%llu/%llu/%llu/%llu/%llu",
+                now[0] - last[0], now[1] - last[1], now[2] - last[2], now[3] - last[3],
+                now[4] - last[4], now[5] - last[5], now[6] - last[6], now[7] - last[7],
+                now[8] - last[8], now[9] - last[9], now[10] - last[10], now[11] - last[11],
+                now[12] - last[12], now[13] - last[13], now[14] - last[14]);
+            memcpy(last, now, sizeof(last));
+        }
         lastFrozen = frozen;
         lastIneligible = ineligible;
         lastWarmUp = warmUp;
@@ -4098,6 +4496,12 @@ void ReadConfiguration() {
         GetPrivateProfileIntW(L"Presentation", L"bFirstPersonWorld", 1, path.c_str()) != 0;
     g_killCamCameraEnabled =
         GetPrivateProfileIntW(L"Presentation", L"bKillCamCamera", 1, path.c_str()) != 0;
+    g_lowRateRulesEnabled =
+        GetPrivateProfileIntW(L"Presentation", L"bLowRateRules", 1, path.c_str()) != 0;
+    g_latePlayerPositionEnabled =
+        GetPrivateProfileIntW(L"Presentation", L"bLatePlayerPosition", 1, path.c_str()) != 0;
+    g_killCamTickPosesEnabled =
+        GetPrivateProfileIntW(L"Presentation", L"bKillCamTickPoses", 1, path.c_str()) != 0;
     g_worldDumpEnabled = g_telemetryEnabled &&
         GetPrivateProfileIntW(L"Tracing", L"bWorldDump", 0, path.c_str()) != 0;
     g_fpTraceEnabled = g_telemetryEnabled &&
@@ -4186,14 +4590,23 @@ bool VerifyTargetLayout() {
 
 // Mods that patch the same timer. They may load after this plugin, so their
 // files are looked for instead of their patches.
+//
+// NVTF patches the timer only when [Main] bGTCFix is set in its INI: that one
+// switch gates its GetTickCount replacement, its timer hook and its writes to
+// the Havok maximum step. Its other parts (fast exit, threading, hash tables,
+// DirectX) patch none of this plugin's sites. With bGTCFix=0 it is accepted.
+// The INI is read the way NVTF reads it, with the same default.
 const wchar_t *FindConflictingMod() {
-    static const wchar_t *const kFiles[] = {
-        L"Data\\NVSE\\Plugins\\NVTF.dll",
-        L"Data\\NVSE\\Plugins\\sr_New_Vegas_Stutter_Remover.dll",
-    };
-    for (const wchar_t *file : kFiles) {
-        if (FileExists(GameDirectoryPath(file))) return file;
+    static const wchar_t kNvtf[] = L"Data\\NVSE\\Plugins\\NVTF.dll";
+    if (FileExists(GameDirectoryPath(kNvtf))) {
+        const std::wstring ini = GameDirectoryPath(L"Data\\NVSE\\Plugins\\NVTF.ini");
+        const UINT gtcFix = GetPrivateProfileIntW(L"Main", L"bGTCFix", 0, ini.c_str());
+        if (gtcFix != 0) return kNvtf;
+        AppendStatus("NVTF is installed with bGTCFix=0 (its timer changes are off); continuing");
     }
+    static const wchar_t kStutterRemover[] =
+        L"Data\\NVSE\\Plugins\\sr_New_Vegas_Stutter_Remover.dll";
+    if (FileExists(GameDirectoryPath(kStutterRemover))) return kStutterRemover;
     return nullptr;
 }
 
@@ -4212,7 +4625,8 @@ BOOL CALLBACK InitializePatch(PINIT_ONCE, PVOID, PVOID *) {
         return TRUE;
     }
     if (const wchar_t *conflict = FindConflictingMod()) {
-        AppendStatus("hooks disabled: %ls is installed and patches the same timer", conflict);
+        AppendStatus("hooks disabled: %ls is installed and patches the same timer (for NVTF, "
+                     "set bGTCFix=0 in NVTF.ini to use both)", conflict);
         return TRUE;
     }
 
@@ -4323,7 +4737,8 @@ BOOL CALLBACK InitializePatch(PINIT_ONCE, PVOID, PVOID *) {
                  "interpolate_camera=%d sky=%d third_person_camera=%d "
                  "third_person_body=%d first_person=%d first_person_pass_camera=%d "
                  "first_person_world=%d kill_cam_camera=%d interpolate_fov=%d actors=%d "
-                 "objects=%d menu_real_time=%d",
+                 "objects=%d menu_real_time=%d low_rate_rules=%d late_player_position=%d "
+                 "kill_cam_tick_poses=%d",
                  g_fixedTickEnabled ? 1 : 0, 1000.0 / g_simulationStepMs,
                  g_noTimerSleepsEnabled ? 1 : 0, g_maxWallDeltaMs,
                  g_freezeFramesEnabled ? 1 : 0, g_alignHavokStepEnabled ? 1 : 0,
@@ -4333,7 +4748,9 @@ BOOL CALLBACK InitializePatch(PINIT_ONCE, PVOID, PVOID *) {
                  g_firstPersonEnabled ? 1 : 0, g_fpPassInstalled ? 1 : 0,
                  g_firstPersonWorldEnabled ? 1 : 0, g_killCamCameraEnabled ? 1 : 0,
                  g_interpolateFovEnabled ? 1 : 0, g_interpolateActorsEnabled ? 1 : 0,
-                 g_interpolateObjectsEnabled ? 1 : 0, g_menuRealTimeEnabled ? 1 : 0);
+                 g_interpolateObjectsEnabled ? 1 : 0, g_menuRealTimeEnabled ? 1 : 0,
+                 g_lowRateRulesEnabled ? 1 : 0, g_latePlayerPositionEnabled ? 1 : 0,
+                 g_killCamTickPosesEnabled ? 1 : 0);
     return TRUE;
 }
 

@@ -26,3 +26,8 @@ set_target_properties(FalloutNVHFR PROPERTIES
 
 add_executable(asi_smoke tests/asi_smoke.cpp)
 falloutnvhfr_settings(asi_smoke)
+
+# Includes the plugin source and runs its per-draw classifiers on synthetic
+# values; installs nothing.
+add_executable(classifier_test tests/classifier_test.cpp)
+falloutnvhfr_settings(classifier_test)

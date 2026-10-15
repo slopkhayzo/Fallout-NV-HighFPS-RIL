@@ -16,7 +16,7 @@ on every frame.
 It is a port of the Fallout 3 patch (Fallout3HFR 1.0.0) and ships as an ASI
 plugin.
 
-**Current version: 1.0.1.** Download it from the
+**Current version: 1.0.2.** Download it from the
 [Releases page](https://github.com/slopkhayzo/Fallout-NV-HighFPS-RIL/releases).
 
 ## Download
@@ -25,8 +25,8 @@ Each release has two zip files:
 
 | File | Contents | Use it if |
 | --- | --- | --- |
-| `FalloutNVHFR-1.0.1.zip` | `FalloutNVHFR.asi`, `FalloutNVHFR.ini`, `FalloutNVHFR-README.txt` | You already have a 32-bit ASI loader |
-| `FalloutNVHFR-1.0.1-with-ASI-Loader.zip` | The same files, plus Ultimate ASI Loader as `dinput8.dll` and its licence | You have no ASI loader yet |
+| `FalloutNVHFR-1.0.2.zip` | `FalloutNVHFR.asi`, `FalloutNVHFR.ini`, `FalloutNVHFR-README.txt` | You already have a 32-bit ASI loader |
+| `FalloutNVHFR-1.0.2-with-ASI-Loader.zip` | The same files, plus Ultimate ASI Loader as `dinput8.dll` and its licence | You have no ASI loader yet |
 
 ## Why
 
@@ -85,12 +85,16 @@ modified by the interpolation.
   as `dinput8.dll`.
 - **A frame rate limit outside the game**, from the graphics driver or a tool
   such as RTSS. Tested with a limit of 240.
-- NVSE is not needed.
+- NVSE is not needed. Tested with xNVSE 6.4.9 started through
+  `nvse_loader.exe`.
 
-**Not compatible with NVTF or New Vegas Stutter Remover.** Both patch the
-same timer. If either is found in `Data\NVSE\Plugins`, FalloutNVHFR does not
-install. If another mod patches the same call sites later, the patch switches
-itself off on the first frame.
+**NVTF only with its timing off; not compatible with New Vegas Stutter
+Remover.** Both patch the same timer as FalloutNVHFR. NVTF can stay installed
+if `bGTCFix=0` is set under `[Main]` in `Data\NVSE\Plugins\NVTF.ini`. That
+one switch turns off all of NVTF's timing changes, and its other fixes keep
+working. With `bGTCFix=1`, or with Stutter Remover in `Data\NVSE\Plugins`,
+FalloutNVHFR does not install. If another mod patches the same call sites
+later, the patch switches itself off on the first frame.
 
 ## Install
 
@@ -148,6 +152,22 @@ at their defaults.
 
 ## Changes
 
+**1.0.2**
+
+- Runs next to NVTF when NVTF's `bGTCFix=0`. The patch reads `NVTF.ini` the
+  way NVTF does and refuses to install only when its timing is on.
+- Below about 2.5 draws per tick (about 150 FPS), the rules that decide on
+  which draw a value belongs to a tick (first person, third-person body and
+  camera offset, field of view, kill camera) handle consecutive tick draws.
+  Above that rate every decision is 1.0.1's. Switch `bLowRateRules`. Fixes
+  single-frame twitches of the weapon while looking around at 90 FPS.
+- The player's position can arrive a draw after its tick (seen while dying)
+  and is then blended with that draw's phase. Switch `bLatePlayerPosition`.
+- Kill camera: the camera's pose on each tick draw is that tick's, and
+  changes up to two draws later belong to the next tick. A camera that keeps
+  moving on later draws is shown as it is. Switch `bKillCamTickPoses`. Fixes
+  a stepped death camera at every frame rate.
+
 **1.0.1**
 
 - First person: the arms and weapon no longer step and trail the view while
@@ -180,10 +200,13 @@ This produces:
 
 - `FalloutNVHFR.asi`: the plugin, C++20 with a static runtime;
 - `asi_smoke.exe`: a smoke test that loads the plugin outside the game and
-  checks that it recognises the wrong executable and changes nothing.
+  checks that it recognises the wrong executable and changes nothing;
+- `classifier_test.exe`: runs the plugin's per-draw interpolation rules on
+  synthetic motion at 90 to 350 FPS and checks the result.
 
 ```bat
 build-x86\asi_smoke.exe build-x86\FalloutNVHFR.asi
+build-x86\classifier_test.exe
 ```
 
 ## Repository layout
@@ -192,6 +215,7 @@ build-x86\asi_smoke.exe build-x86\FalloutNVHFR.asi
 | --- | --- |
 | [src/FalloutNVHFR.cpp](src/FalloutNVHFR.cpp) | The whole plugin: layout checks, hooks, fixed tick, input latch, interpolation, logging |
 | [tests/asi_smoke.cpp](tests/asi_smoke.cpp) | Smoke-test loader |
+| [tests/classifier_test.cpp](tests/classifier_test.cpp) | Interpolation rules on synthetic motion, against copies of the 1.0.1 rules |
 | [packaging/](packaging/) | Release INI and the plain-text readme that ship in the zip files |
 | `research/` | Not tracked: the port plan, analysis scripts, captures, reference sources and tools |
 

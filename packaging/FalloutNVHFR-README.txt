@@ -1,4 +1,4 @@
-FalloutNVHFR 1.0.1
+FalloutNVHFR 1.0.2
 High-frame-rate patch for Fallout: New Vegas
 ==================================================
 
@@ -46,8 +46,8 @@ Requirements
   - A frame rate limit set outside the game (graphics driver or a limiter
     tool such as RTSS). Tested with a limit of 240.
   - Tested with the game's own settings as the launcher writes them
-    (iFPSClamp=0, V-Sync off). The script extender (NVSE) is not needed; the
-    patch has not been tried together with it.
+    (iFPSClamp=0, V-Sync off). The script extender (NVSE) is not needed.
+    It has been tried with xNVSE 6.4.9 started through nvse_loader.exe.
 
 
 Install
@@ -117,9 +117,12 @@ Known limitations
   - The "spider hands" bug (fingers stretching at high frame rates) is not
     corrected by this patch.
   - New Vegas Tick Fix (NVTF) and New Vegas Stutter Remover change the same
-    timer. If either is found in Data\NVSE\Plugins, this patch does not
-    install. If another mod changes the same code after the patch has
-    installed, the patch switches itself off on the first frame.
+    timer. If Stutter Remover is found in Data\NVSE\Plugins, this patch does
+    not install. NVTF can stay installed with its timing switched off: set
+    bGTCFix=0 under [Main] in Data\NVSE\Plugins\NVTF.ini. Its other fixes
+    keep working. With bGTCFix=1 this patch does not install. If another
+    mod changes the same code after the patch has installed, the patch
+    switches itself off on the first frame.
 
 
 If it does not load
@@ -134,8 +137,9 @@ Start the game once and open FalloutNVHFR.log next to the .asi.
     patch was made for (a different release, an executable that is still
     packed when the patch loads, or code already changed by another mod).
     Nothing was changed; the game runs unmodified.
-  - "hooks disabled: ... is installed and patches the same timer": remove
-    the named mod or this patch.
+  - "hooks disabled: ... is installed and patches the same timer": for NVTF,
+    set bGTCFix=0 in Data\NVSE\Plugins\NVTF.ini; otherwise remove the named
+    mod or this patch.
   - "hooks rolled back": something prevented the patch from installing
     completely. Nothing was left changed.
   - "first frame: hook sites were patched by something else": another mod
@@ -146,6 +150,16 @@ Start the game once and open FalloutNVHFR.log next to the .asi.
 
 Changes
 -------
+1.0.2
+  - Works together with New Vegas Tick Fix (NVTF) when NVTF's timing is
+    switched off (bGTCFix=0 in NVTF.ini). NVTF's other fixes still apply.
+  - Below about 150 frames a second (fewer than 2.5 frames per tick),
+    first-person arms and weapon, the player's body, the third-person
+    camera, the field of view and the kill camera follow the game's timing
+    more closely. This removes small twitches of the weapon while looking
+    around at around 90 frames a second. Above that rate nothing changes.
+  - Death camera and kill cameras: the player's body and the camera no
+    longer step, at any frame rate.
 1.0.1
   - First person: the arms and weapon no longer step and trail the view
     while aiming down the sights or crouching and standing up. The arms
