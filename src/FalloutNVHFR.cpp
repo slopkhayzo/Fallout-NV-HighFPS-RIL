@@ -29,7 +29,7 @@
 
 namespace {
 
-constexpr char kPatchVersion[] = "1.0.2";
+constexpr char kPatchVersion[] = "1.0.3";
 
 // The build this was developed against (GOG 1.4.0.525). Reported in the log
 // for comparison only; nothing is refused because of it.
@@ -68,6 +68,33 @@ constexpr size_t kAuxTimerSiteCount = sizeof(kAuxTimerSites) / sizeof(kAuxTimerS
 constexpr uintptr_t kInputPollCall = 0x0086F39E;
 constexpr uint8_t kInputPollCallBytes[5] = {0xE8, 0x6D, 0x3C, 0x1B, 0x00};
 constexpr uintptr_t kInputPollFunction = 0x00A23010;
+
+// call FUN_009445B0, the player's look input (thiscall on the player, four
+// arguments, the first a delta), from FUN_0093E860, the player's per-frame
+// controls (PlayerCharacter vtable +0x2F8). The frame's input step calls
+// that on every frame outside menus and fly-cam, frozen frames included,
+// with the main timer's delta times the VATS time multiplier, and it passes
+// the delta on unchanged. Mouse look does not use it; the vanity (free look)
+// orbit, gamepad look and a camera smoothing step multiply a per-frame input
+// by it.
+constexpr uintptr_t kLookInputCall = 0x0093F8D9;
+constexpr uint8_t kLookInputCallBytes[5] = {0xE8, 0xD2, 0x4C, 0x00, 0x00};
+constexpr uintptr_t kLookInputFunction = 0x009445B0;
+
+// The held-object update FUN_00960520 runs on every frame from the player's
+// controls and does not use its delta. When the held object is a ragdoll
+// farther than fZKeyComplexHelperMinDistance from the grab point, it pushes
+// it towards it with an impulse built from fZKeyComplexHelperScale and the
+// weight, on every frame: through FUN_0062B8D0 (cdecl: node, impulse, 0;
+// every rigid body below an actor's node) or bhkRigidBody FUN_00561690
+// (thiscall: impulse). An impulse changes the velocity at once, so the
+// pushes of the frames between ticks add up before the next physics step.
+constexpr uintptr_t kGrabHelperActorCall = 0x00960F8E;
+constexpr uint8_t kGrabHelperActorCallBytes[5] = {0xE8, 0x3D, 0xA9, 0xCC, 0xFF};
+constexpr uintptr_t kGrabHelperActorFunction = 0x0062B8D0;
+constexpr uintptr_t kGrabHelperBodyCall = 0x00961051;
+constexpr uint8_t kGrabHelperBodyCallBytes[5] = {0xE8, 0x3A, 0x06, 0xC0, 0xFF};
+constexpr uintptr_t kGrabHelperBodyFunction = 0x00561690;
 
 // call FUN_00873200, the main world draw (thiscall, four arguments), from the
 // two variants of the composite render function.
@@ -304,6 +331,8 @@ bool g_noTimerSleepsEnabled = true;
 bool g_freezeFramesEnabled = true;
 bool g_alignHavokStepEnabled = true;
 bool g_latchInputEnabled = true;
+bool g_lookInputRealDeltaEnabled = true;
+bool g_fixedGrabForceEnabled = true;
 bool g_menuMouseNoAcceleration = true;
 bool g_interpolateCameraEnabled = true;
 bool g_shiftSkyEnabled = true;
@@ -412,6 +441,10 @@ struct Counters {
     std::atomic<uint64_t> latchEdgesDeferred{0};
     std::atomic<uint64_t> latchEdgesDelivered{0};
     std::atomic<uint64_t> latchTapsRecovered{0};
+    std::atomic<uint64_t> lookInputCalls{0};
+    std::atomic<uint64_t> lookInputRealDelta{0}; // given the frame's real time
+    std::atomic<uint64_t> grabHelperApplied{0};
+    std::atomic<uint64_t> grabHelperSkipped{0};  // frame between ticks: not pushed
     std::atomic<uint64_t> faults{0};
     std::atomic<uint64_t> draws{0};
     std::atomic<uint64_t> drawsOutsideFrame{0};
@@ -3904,6 +3937,62 @@ void __fastcall InputPollHook(void *self, void * /*edx*/) {
     }
 }
 
+// The player's look input multiplies the vanity (free look) mouse movement
+// and the gamepad stick by the frame's delta. Under the fixed tick that delta
+// is one tick on tick frames and almost nothing on the frames between, so
+// the movement read on those frames was lost and free look and stick look
+// stepped at the tick rate. The function tests no freeze flag and runs in
+// full on every frame, so it is given the frame's real time instead, scaled
+// by the time multiplier as the timer's delta is. Over a second the time it
+// is given is the same; only its spread over the frames changes. Frames that
+// already run on real time are left as they are. The delta arrives scaled by
+// the global and the VATS time multipliers; their product is the delta over
+// the timer's unscaled one, and the real time is scaled by the same.
+uint32_t __fastcall LookInputHook(void *self, void * /*edx*/, float delta, uint32_t arg1,
+                                  uint32_t arg2, uint32_t arg3) {
+    using LookInputFn = uint32_t(__thiscall *)(void *, float, uint32_t, uint32_t, uint32_t);
+    g_counters.lookInputCalls.fetch_add(1, std::memory_order_relaxed);
+    const float unscaled = reinterpret_cast<const BSTimer *>(kMainTimer)->realDeltaSeconds;
+    if (g_lookInputRealDeltaEnabled && g_hooksInstalled.load(std::memory_order_relaxed) &&
+        g_frameTickDecision >= 0 && !g_frameNativeStep &&
+        GetCurrentThreadId() == g_mainThreadId && unscaled > 0.0f) {
+        const double multiplier = static_cast<double>(delta) / unscaled;
+        const double wallMs = g_frameWallDeltaMs > 100.0 ? 100.0 : g_frameWallDeltaMs;
+        const float scaled = static_cast<float>(wallMs * 0.001 * multiplier);
+        if (std::isfinite(scaled) && multiplier >= 0.0 && multiplier <= 20.0) {
+            delta = scaled;
+            g_counters.lookInputRealDelta.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return reinterpret_cast<LookInputFn>(kLookInputFunction)(self, delta, arg1, arg2, arg3);
+}
+
+// A held ragdoll is pushed once per frame (see kGrabHelperActorCall), so the
+// force grew with the frame rate. Under the fixed tick the push is given on
+// tick frames only: one per tick, as the game gives it at 60 frames a
+// second. Real-time frames keep the engine's behaviour. Changes the
+// simulation, so it has its own switch.
+bool SkipGrabHelperImpulse() {
+    const bool skip = g_fixedGrabForceEnabled && g_hooksInstalled.load(std::memory_order_relaxed) &&
+                      g_frameTickDecision == 0 && !g_frameNativeStep &&
+                      GetCurrentThreadId() == g_mainThreadId;
+    (skip ? g_counters.grabHelperSkipped : g_counters.grabHelperApplied)
+        .fetch_add(1, std::memory_order_relaxed);
+    return skip;
+}
+
+void __cdecl GrabHelperActorHook(void *node, const float *impulse, uint32_t flags) {
+    using ImpulseFn = void(__cdecl *)(void *, const float *, uint32_t);
+    if (SkipGrabHelperImpulse()) return;
+    reinterpret_cast<ImpulseFn>(kGrabHelperActorFunction)(node, impulse, flags);
+}
+
+void __fastcall GrabHelperBodyHook(void *body, void * /*edx*/, const float *impulse) {
+    using ImpulseFn = void(__thiscall *)(void *, const float *);
+    if (SkipGrabHelperImpulse()) return;
+    reinterpret_cast<ImpulseFn>(kGrabHelperBodyFunction)(body, impulse);
+}
+
 // Sets the four cursor settings to 0, which makes the cursor's speed factor
 // a constant 1. Changes values the engine keeps; done once.
 void RemoveMenuMouseAcceleration() {
@@ -4156,13 +4245,25 @@ DWORD WINAPI LogThread(LPVOID) {
         const uint64_t delivered =
             g_counters.latchEdgesDelivered.load(std::memory_order_relaxed);
         const uint64_t taps = g_counters.latchTapsRecovered.load(std::memory_order_relaxed);
+        static uint64_t lastLookCalls = 0, lastLookReal = 0;
+        const uint64_t lookCalls = g_counters.lookInputCalls.load(std::memory_order_relaxed);
+        const uint64_t lookReal = g_counters.lookInputRealDelta.load(std::memory_order_relaxed);
+        static uint64_t lastGrabApplied = 0, lastGrabSkipped = 0;
+        const uint64_t grabApplied = g_counters.grabHelperApplied.load(std::memory_order_relaxed);
+        const uint64_t grabSkipped = g_counters.grabHelperSkipped.load(std::memory_order_relaxed);
         AppendStatus(
 "freeze frozen=%llu ineligible=%llu warm_up=%llu real_time=%llu havok_max_time=%.6f | latch "
-            "polls=%llu edges deferred=%llu delivered=%llu taps_recovered=%llu | faults=%llu",
+            "polls=%llu edges deferred=%llu delivered=%llu taps_recovered=%llu | look_input "
+            "calls=%llu real_delta=%llu | grab_push applied=%llu skipped=%llu | faults=%llu",
             frozen - lastFrozen, ineligible - lastIneligible, warmUp - lastWarmUp,
             nativeFrames - lastNative, *reinterpret_cast<const float *>(kHavokMaxTime), polls - lastPolls,
             deferred - lastDeferred, delivered - lastDelivered, taps - lastTaps,
-            g_counters.faults.load(std::memory_order_relaxed));
+            lookCalls - lastLookCalls, lookReal - lastLookReal, grabApplied - lastGrabApplied,
+            grabSkipped - lastGrabSkipped, g_counters.faults.load(std::memory_order_relaxed));
+        lastLookCalls = lookCalls;
+        lastLookReal = lookReal;
+        lastGrabApplied = grabApplied;
+        lastGrabSkipped = grabSkipped;
         {
             static uint64_t last[11]{};
             const uint64_t now[11] = {
@@ -4469,6 +4570,12 @@ void ReadConfiguration() {
     g_latchInputEnabled =
         g_fixedTickEnabled &&
         GetPrivateProfileIntW(L"Input", L"bLatchInput", 1, path.c_str()) != 0;
+    g_lookInputRealDeltaEnabled =
+        g_fixedTickEnabled &&
+        GetPrivateProfileIntW(L"Input", L"bLookInputRealDelta", 1, path.c_str()) != 0;
+    g_fixedGrabForceEnabled =
+        g_fixedTickEnabled &&
+        GetPrivateProfileIntW(L"Timing", L"bFixedGrabForce", 1, path.c_str()) != 0;
     g_menuMouseNoAcceleration =
         GetPrivateProfileIntW(L"Input", L"bMenuMouseNoAcceleration", 1, path.c_str()) != 0;
 
@@ -4727,14 +4834,46 @@ BOOL CALLBACK InitializePatch(PINIT_ONCE, PVOID, PVOID *) {
         }
         g_counters.fovSites.store(sites, std::memory_order_relaxed);
     }
+    if (g_lookInputRealDeltaEnabled) {
+        // Not essential: if the site does not match, look input keeps the
+        // engine's delta.
+        uint8_t written[5];
+        g_lookInputRealDeltaEnabled =
+            PatchRelativeCall(kLookInputCall, reinterpret_cast<const void *>(&LookInputHook),
+                              kLookInputCallBytes, written);
+        if (!g_lookInputRealDeltaEnabled) {
+            AppendStatus("look input call at %08IX does not hold the expected bytes; left as it "
+                         "is", kLookInputCall);
+        }
+    }
+    if (g_fixedGrabForceEnabled) {
+        // Not essential: both sites or neither, so that the two kinds of
+        // held body behave alike.
+        if (MatchesBytes(kGrabHelperActorCall, kGrabHelperActorCallBytes, 5) &&
+            MatchesBytes(kGrabHelperBodyCall, kGrabHelperBodyCallBytes, 5)) {
+            uint8_t written[5];
+            g_fixedGrabForceEnabled =
+                PatchRelativeCall(kGrabHelperActorCall,
+                                  reinterpret_cast<const void *>(&GrabHelperActorHook),
+                                  kGrabHelperActorCallBytes, written) &&
+                PatchRelativeCall(kGrabHelperBodyCall,
+                                  reinterpret_cast<const void *>(&GrabHelperBodyHook),
+                                  kGrabHelperBodyCallBytes, written);
+        } else {
+            g_fixedGrabForceEnabled = false;
+        }
+        if (!g_fixedGrabForceEnabled) {
+            AppendStatus("held-body push calls do not hold the expected bytes; left as they are");
+        }
+    }
     g_hooksInstalled.store(true, std::memory_order_release);
     if (g_telemetryEnabled) {
         g_logThread = CreateThread(nullptr, 0, LogThread, nullptr, 0, nullptr);
     }
     AppendStatus("installed: frame hook=1 timer hook=1 fixed_tick=%d sim_hz=%.3f "
                  "no_timer_sleeps=%d max_wall_delta_ms=%.1f freeze_frames=%d "
-                 "align_havok_step=%d latch_input=%d menu_mouse_no_acceleration=%d "
-                 "interpolate_camera=%d sky=%d third_person_camera=%d "
+                 "align_havok_step=%d fixed_grab_force=%d latch_input=%d look_input_real_delta=%d "
+                 "menu_mouse_no_acceleration=%d interpolate_camera=%d sky=%d third_person_camera=%d "
                  "third_person_body=%d first_person=%d first_person_pass_camera=%d "
                  "first_person_world=%d kill_cam_camera=%d interpolate_fov=%d actors=%d "
                  "objects=%d menu_real_time=%d low_rate_rules=%d late_player_position=%d "
@@ -4742,7 +4881,9 @@ BOOL CALLBACK InitializePatch(PINIT_ONCE, PVOID, PVOID *) {
                  g_fixedTickEnabled ? 1 : 0, 1000.0 / g_simulationStepMs,
                  g_noTimerSleepsEnabled ? 1 : 0, g_maxWallDeltaMs,
                  g_freezeFramesEnabled ? 1 : 0, g_alignHavokStepEnabled ? 1 : 0,
-                 g_latchInputEnabled ? 1 : 0, g_menuMouseNoAcceleration ? 1 : 0,
+                 g_fixedGrabForceEnabled ? 1 : 0,
+                 g_latchInputEnabled ? 1 : 0, g_lookInputRealDeltaEnabled ? 1 : 0,
+                 g_menuMouseNoAcceleration ? 1 : 0,
                  g_interpolateCameraEnabled ? 1 : 0, g_shiftSkyEnabled ? 1 : 0,
                  g_thirdPersonCameraEnabled ? 1 : 0, g_thirdPersonBodyEnabled ? 1 : 0,
                  g_firstPersonEnabled ? 1 : 0, g_fpPassInstalled ? 1 : 0,

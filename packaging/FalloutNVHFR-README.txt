@@ -1,4 +1,4 @@
-FalloutNVHFR 1.0.2
+FalloutNVHFR 1.0.3
 High-frame-rate patch for Fallout: New Vegas
 ==================================================
 
@@ -89,6 +89,11 @@ Settings (FalloutNVHFR.ini)
                             Set to 0 if you get a crash or a physics glitch
                             right after closing a menu; those moments then
                             look stepped instead.
+  bFixedGrabForce           1 = a body held with the grab key is pulled
+                            with the same force at any frame rate, as at
+                            60 frames a second. 0 = the game's own
+                            behaviour: the higher the frame rate, the
+                            stronger the pull (bodies can be thrown far).
   bMenuMouseNoAcceleration  1 = plain, unaccelerated mouse cursor in menus.
                             0 = the game's own cursor behaviour.
   bTelemetry                1 = write diagnostics to FalloutNVHFR.log
@@ -150,6 +155,14 @@ Start the game once and open FalloutNVHFR.log next to the .asi.
 
 Changes
 -------
+1.0.3
+  - Third-person free look (holding the view key and moving the mouse) and
+    looking around with a gamepad stick are smooth. They moved only 60
+    times a second; their speed is unchanged.
+  - A body held with the grab key is pulled with the same force at any
+    frame rate. The game pushes it once per frame, so it was pulled much
+    harder at high frame rates. New setting bFixedGrabForce (0 restores
+    the game's behaviour).
 1.0.2
   - Works together with New Vegas Tick Fix (NVTF) when NVTF's timing is
     switched off (bGTCFix=0 in NVTF.ini). NVTF's other fixes still apply.

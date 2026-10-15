@@ -16,7 +16,7 @@ on every frame.
 It is a port of the Fallout 3 patch (Fallout3HFR 1.0.0) and ships as an ASI
 plugin.
 
-**Current version: 1.0.2.** Download it from the
+**Current version: 1.0.3.** Download it from the
 [Releases page](https://github.com/slopkhayzo/Fallout-NV-HighFPS-RIL/releases).
 
 ## Download
@@ -25,8 +25,8 @@ Each release has two zip files:
 
 | File | Contents | Use it if |
 | --- | --- | --- |
-| `FalloutNVHFR-1.0.2.zip` | `FalloutNVHFR.asi`, `FalloutNVHFR.ini`, `FalloutNVHFR-README.txt` | You already have a 32-bit ASI loader |
-| `FalloutNVHFR-1.0.2-with-ASI-Loader.zip` | The same files, plus Ultimate ASI Loader as `dinput8.dll` and its licence | You have no ASI loader yet |
+| `FalloutNVHFR-1.0.3.zip` | `FalloutNVHFR.asi`, `FalloutNVHFR.ini`, `FalloutNVHFR-README.txt` | You already have a 32-bit ASI loader |
+| `FalloutNVHFR-1.0.3-with-ASI-Loader.zip` | The same files, plus Ultimate ASI Loader as `dinput8.dll` and its licence | You have no ASI loader yet |
 
 ## Why
 
@@ -131,6 +131,7 @@ The settings players may change, from [packaging/FalloutNVHFR.ini](packaging/Fal
 | `bTelemetry` | 0 | Writes a status block to `FalloutNVHFR.log` every 5 s (several MB an hour). Turn it on only to report a problem. |
 | `fSimulationHz` | 60 | Leave at 60. Higher values are refused. |
 | `bMenuRealTime` | 1 | Menus, conversations, loading and the 30 frames after them run on real frame time. Set to 0 if you get crashes or physics glitches right after closing a menu. |
+| `bFixedGrabForce` | 1 | A body held with the grab key is pulled with the same force at any frame rate, as at 60 FPS. 0 restores the game's behaviour: the higher the frame rate, the stronger the pull. |
 | `bMenuMouseNoAcceleration` | 1 | Plain, unaccelerated menu cursor. |
 
 Every other mechanism has its own switch under the "Internals" headings. They
@@ -151,6 +152,22 @@ at their defaults.
   corrected.
 
 ## Changes
+
+**1.0.3**
+
+- Third-person free look (vanity mode) and gamepad look are smooth. The
+  player's look input multiplies them by the frame's delta, which under the
+  fixed tick is one tick or almost nothing, so they moved only on tick
+  frames. The call from the player's per-frame controls is given the frame's
+  real time, scaled by the same time multipliers, so their speed is
+  unchanged. Switch `bLookInputRealDelta`.
+- A held ragdoll is pulled with the same force at any frame rate. The
+  held-object update pushes a ragdoll towards the grab point with an impulse
+  on every frame, not scaled by time, so the pull grew with the frame rate.
+  Under the fixed tick the push is given on tick frames only, as at 60 FPS.
+  Switch `bFixedGrabForce`; 0 restores the game's behaviour. Ordinary
+  objects use the engine's grab spring, which runs once per physics step,
+  and are unaffected.
 
 **1.0.2**
 
